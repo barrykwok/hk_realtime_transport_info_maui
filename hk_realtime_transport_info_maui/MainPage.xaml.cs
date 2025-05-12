@@ -804,54 +804,16 @@ public partial class MainPage : ContentPage
 			// Set items updating scroll mode to keep position
 			collectionView.ItemsUpdatingScrollMode = ItemsUpdatingScrollMode.KeepScrollOffset;
 			
+			// Set a smaller RemainingItemsThreshold to reduce memory usage (moved from AllRoutesCollection block)
+			collectionView.RemainingItemsThreshold = 5;
+			
+			// Add event handler for lazy loading (moved from AllRoutesCollection block)
+			collectionView.RemainingItemsThresholdReached += OnAllRoutesRemainingItemsThresholdReached;
+			
 			// Disable constrained layout for better performance
 			#if WINDOWS
 			Microsoft.Maui.Controls.PlatformConfiguration.WindowsSpecific.CollectionView.SetConstrainLayout(
 				collectionView, false);
-			#endif
-		}
-		
-		// Optimize AllRoutesCollection for better performance with large datasets
-		if (this.FindByName<CollectionView>("AllRoutesCollection") is CollectionView allRoutesCollection)
-		{
-			// Enable virtualization for all routes collection
-			allRoutesCollection.ItemsLayout = new LinearItemsLayout(ItemsLayoutOrientation.Vertical)
-			{
-				ItemSpacing = 5,
-			};
-			
-			// Set items updating scroll mode to keep position
-			allRoutesCollection.ItemsUpdatingScrollMode = ItemsUpdatingScrollMode.KeepScrollOffset;
-			
-			// Set a smaller RemainingItemsThreshold to reduce memory usage
-			allRoutesCollection.RemainingItemsThreshold = 5;
-			
-			// Add event handler for lazy loading
-			allRoutesCollection.RemainingItemsThresholdReached += OnAllRoutesRemainingItemsThresholdReached;
-			
-			// Disable constrained layout for better performance
-			#if WINDOWS
-			Microsoft.Maui.Controls.PlatformConfiguration.WindowsSpecific.CollectionView.SetConstrainLayout(
-				allRoutesCollection, false);
-			#endif
-		}
-		
-		// Also optimize the nearby routes collection
-		if (this.FindByName<CollectionView>("NearbyRoutesCollection") is CollectionView nearbyCollection)
-		{
-			// Enable virtualization for nearby routes collection
-			nearbyCollection.ItemsLayout = new LinearItemsLayout(ItemsLayoutOrientation.Vertical)
-			{
-				ItemSpacing = 5,
-			};
-			
-			// Set items updating scroll mode to keep position
-			nearbyCollection.ItemsUpdatingScrollMode = ItemsUpdatingScrollMode.KeepScrollOffset;
-			
-			// Disable constrained layout for better performance
-			#if WINDOWS
-			Microsoft.Maui.Controls.PlatformConfiguration.WindowsSpecific.CollectionView.SetConstrainLayout(
-				nearbyCollection, false);
 			#endif
 		}
 		
@@ -918,17 +880,12 @@ public partial class MainPage : ContentPage
 		// Ensure the alphabet keys are initialized
 		KeyboardManager.InitializeKeyboardState();
 		
-		// Add scroll handler to collection views
-		if (this.FindByName<CollectionView>("NearbyRoutesCollection") is CollectionView nearbyCollectionView)
+		// Add scroll handler to collection view and optimize
+		if (this.FindByName<CollectionView>("RoutesCollection") is CollectionView collectionView)
 		{
-			nearbyCollectionView.Scrolled += OnCollectionViewScrolled;
-			OptimizeCollectionView(nearbyCollectionView);
-		}
-		
-		if (this.FindByName<CollectionView>("AllRoutesCollection") is CollectionView allCollectionView)
-		{
-			allCollectionView.Scrolled += OnCollectionViewScrolled;
-			OptimizeCollectionView(allCollectionView);
+			collectionView.Scrolled -= OnCollectionViewScrolled; // Ensure it's not added multiple times
+			collectionView.Scrolled += OnCollectionViewScrolled;
+			OptimizeCollectionView(collectionView);
 		}
 		
 		// Set initial view visibility based on current filter
@@ -1016,17 +973,6 @@ public partial class MainPage : ContentPage
 			if (this.FindByName<CollectionView>("RoutesCollection") is CollectionView collectionView)
 			{
 				collectionView.Scrolled -= OnCollectionViewScrolled;
-			}
-			
-			// Remove scroll handlers from new collection views
-			if (this.FindByName<CollectionView>("NearbyRoutesCollection") is CollectionView nearbyCollectionView)
-			{
-				nearbyCollectionView.Scrolled -= OnCollectionViewScrolled;
-			}
-			
-			if (this.FindByName<CollectionView>("AllRoutesCollection") is CollectionView allCollectionView)
-			{
-				allCollectionView.Scrolled -= OnCollectionViewScrolled;
 			}
 			
 			// Return animations to normal
@@ -3878,8 +3824,8 @@ public partial class MainPage : ContentPage
 			// Show small loading indicator in the status bar if possible
 			IsBusy = true;
 			
-			// First, find the AllRoutesCollection and prepare it for optimal performance
-			var allRoutesCollection = this.FindByName<CollectionView>("AllRoutesCollection");
+			// First, find the RoutesCollection and prepare it for optimal performance
+			var routesCollection = this.FindByName<CollectionView>("RoutesCollection");
 			
 			// Start with an empty observable collection
 			var newCollection = new ObservableRangeCollection<object>();
