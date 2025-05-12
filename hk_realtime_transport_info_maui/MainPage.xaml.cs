@@ -1974,6 +1974,44 @@ public partial class MainPage : ContentPage
 		
 		_logger?.LogDebug("Found nearby stops: 100m={0}, 200m={1}, 400m={2}, 600m={3}",
 			stops100m.Count, stops200m.Count, stops400m.Count, stops600m.Count);
+		
+		// Add this code after line 1975 that logs "Found nearby stops"
+		// Explicitly call ApplyDistanceFilterAsync to ensure UI is updated with the current filter
+		if (_stopsNearby.Count > 0 && _currentDistanceFilter != DistanceFilter.All)
+		{
+			_logger?.LogInformation("Explicitly refreshing UI after loading nearby stops");
+			
+			// Use Task.Run to avoid blocking the UI thread
+			_ = Task.Run(async () =>
+			{
+				try
+				{
+					// Apply the current filter
+					var result = await ApplyDistanceFilterAsync(DistanceFilter.All, _currentDistanceFilter);
+					
+					// Update UI on main thread
+					await MainThread.InvokeOnMainThreadAsync(() =>
+					{
+						// Explicitly set Routes property
+						Routes = result;
+						
+						// Force refresh collection view
+						var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+						if (collectionView != null)
+						{
+							collectionView.ItemsSource = null;
+							collectionView.ItemsSource = Routes;
+						}
+						
+						_logger?.LogInformation("Force-refreshed UI with {count} items", result.Count);
+					});
+				}
+				catch (Exception ex)
+				{
+					_logger?.LogError(ex, "Error force-refreshing UI: {message}", ex.Message);
+				}
+			});
+		}
 	}
 	
 	/// <summary>
