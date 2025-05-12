@@ -346,9 +346,10 @@ public partial class App : Application
 		}
 		
 		// Check if this is being called during distance filter operations
-		if (stackTrace.Contains("OnDistanceFilterClicked") || 
+		if (stackTrace.Contains("LoadRoutesDirectly") || 
+		    stackTrace.Contains("UpdateNearbyStops") || 
 		    stackTrace.Contains("ApplyDistanceFilterAsync") || 
-		    stackTrace.Contains("IncrementallyUpdateStopGroups"))
+		    false)
 		{
 			_logger?.LogInformation("Auto data refresh prevented during distance filter change operation");
 			return;
