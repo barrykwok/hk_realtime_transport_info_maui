@@ -618,4 +618,13 @@ private async Task<ObservableRangeCollection<object>> IncrementallyUpdateStopGro
 	return result;
 }
 
+// Create a timer if it doesn't exist
+if (_locationUpdateTimer == null)
+{
+	_locationUpdateTimer = Dispatcher.CreateTimer();
+	// Use the constant value for consistency
+	_locationUpdateTimer.Interval = TimeSpan.FromSeconds(LocationRefreshIntervalSeconds);
+	_locationUpdateTimer.Tick += LocationUpdateTimer_Tick;
+	
+	_logger?.LogInformation("Created location update timer with interval {0} seconds", _locationUpdateTimer.Interval.TotalSeconds);
 } 

@@ -3510,7 +3510,7 @@ public partial class MainPage : ContentPage
 			{
 				_locationUpdateTimer = Dispatcher.CreateTimer();
 				// Increase interval to reduce location updates and prevent UI freezing
-				_locationUpdateTimer.Interval = TimeSpan.FromSeconds(90); // Increased from 60 to 90 seconds
+				_locationUpdateTimer.Interval = TimeSpan.FromSeconds(LocationRefreshIntervalSeconds); // Use constant value for consistency
 				_locationUpdateTimer.Tick += LocationUpdateTimer_Tick;
 				
 				_logger?.LogInformation("Created location update timer with interval {0} seconds", _locationUpdateTimer.Interval.TotalSeconds);
@@ -3525,7 +3525,7 @@ public partial class MainPage : ContentPage
 						if (_locationUpdateTimer != null && !_locationUpdateTimer.IsRunning)
 						{
 							_locationUpdateTimer.Start();
-							_logger?.LogInformation("Started location update timer with interval {0} seconds", LocationRefreshIntervalSeconds);
+							_logger?.LogInformation("Started location update timer with interval {0} seconds", _locationUpdateTimer.Interval.TotalSeconds);
 						}
 					});
 				});
