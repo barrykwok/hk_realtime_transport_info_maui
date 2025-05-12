@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "hk_realtime_transport_info_maui", "hk_realtime_transport_info_maui\hk_realtime_transport_info_maui.csproj", "{264F7442-346F-4A61-ADF4-D05897D06B36}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|x64.Build.0 = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Debug|x86.Build.0 = Debug|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|Any CPU.Build.0 = Release|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|x64.ActiveCfg = Release|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|x64.Build.0 = Release|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|x86.ActiveCfg = Release|Any CPU
+		{264F7442-346F-4A61-ADF4-D05897D06B36}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

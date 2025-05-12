@@ -1,0 +1,74 @@
+.DS_Store
+
+# Bin and Obj folders
+[Bb]in/
+[Oo]bj/
+
+# Ignore bin and obj folders with pattern for all subdirectories
+**/[Bb]in/
+**/[Oo]bj/
+
+# NuGet Packages
+*.nupkg
+packages/
+*.nuget.props
+*.nuget.targets
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# Visual Studio cache files
+*.[Cc]ache
+!*.[Cc]ache/
+
+# Others
+~$*
+*~
+*.dbmdl
+*.dbproj.schemaview
+*.pfx
+*.publishsettings
+node_modules/
+orleans.codegen.cs
+.DS_Store
+hk-bus-crawling-master/
+
+# .NET MAUI build artifacts
+**/obj/
+**/bin/
+**/Debug/
+**/Release/
+
+# AOT compilation files
+**/nativelibraries/
+**/aot-output/
+
+# Visual Studio files
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xamarin Studio
+.vscode/

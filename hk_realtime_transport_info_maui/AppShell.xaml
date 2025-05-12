@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Shell
+    x:Class="hk_realtime_transport_info_maui.AppShell"
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:local="clr-namespace:hk_realtime_transport_info_maui"
+    Shell.FlyoutBehavior="Flyout"
+    Title="HK Transport Info">
+
+    <!-- Shell content is created programmatically in code-behind -->
+    
+    <Shell.FlyoutFooter>
+        <Grid Padding="20" BackgroundColor="Transparent">
+            <VerticalStackLayout Spacing="10">
+                <Label Text="Language" FontAttributes="Bold" FontSize="16" HorizontalOptions="Center" />
+                <HorizontalStackLayout Spacing="10" HorizontalOptions="Center">
+                    <Button Text="English" Clicked="OnEnglishClicked" WidthRequest="100" />
+                    <Button Text="繁體中文" Clicked="OnTraditionalChineseClicked" WidthRequest="100" />
+                    <Button Text="简体中文" Clicked="OnSimplifiedChineseClicked" WidthRequest="100" />
+                </HorizontalStackLayout>
+            </VerticalStackLayout>
+        </Grid>
+    </Shell.FlyoutFooter>
+
+</Shell>

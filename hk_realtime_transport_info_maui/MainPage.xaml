@@ -1,0 +1,634 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:local="clr-namespace:hk_realtime_transport_info_maui"
+             xmlns:models="clr-namespace:hk_realtime_transport_info_maui.Models"
+             x:Class="hk_realtime_transport_info_maui.MainPage"
+             x:DataType="local:MainPage"
+             Title="Routes">
+
+    <ContentPage.Resources>
+        <ResourceDictionary>
+            <local:DivideValueConverter x:Key="DivideByConverter" />
+            <local:IsStopGroupConverter x:Key="IsStopGroupConverter" />
+            <local:IsNotStopGroupConverter x:Key="IsNotStopGroupConverter" />
+            <local:CountToHeightConverter x:Key="CountToHeightConverter" />
+            <local:ExpandCollapseIconConverter x:Key="ExpandCollapseIconConverter" />
+            
+            <!-- DataTemplate for StopGroup (Expander Header) -->
+            <DataTemplate x:Key="StopGroupTemplate" x:DataType="local:StopGroup">
+                <Border Margin="5,3,5,0" Padding="0" StrokeShape="RoundRectangle 8" BackgroundColor="White" Stroke="#EEEEEE">
+                    <StackLayout BackgroundColor="White">
+                        <!-- Expander Header -->
+                        <Grid Padding="14,8" BackgroundColor="White">
+                            <Grid.GestureRecognizers>
+                                <TapGestureRecognizer Tapped="OnStopGroupTapped" CommandParameter="{Binding .}" />
+                            </Grid.GestureRecognizers>
+                            <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto">
+                                <!-- Icon -->
+                                <Label Grid.Column="0" Grid.Row="0"
+                                       Text="🚌" 
+                                       FontSize="22" 
+                                       VerticalOptions="Center"
+                                       HorizontalOptions="Start" />
+                                
+                                <!-- Stop Name and Distance -->
+                                <StackLayout Grid.Column="1" Grid.Row="0" Orientation="Horizontal" VerticalOptions="Center" Margin="8,0,0,0">
+                                    <Label Text="{Binding Stop.LocalizedName}" 
+                                           FontSize="18"
+                                           FontAttributes="Bold"
+                                           TextColor="Black"
+                                           VerticalOptions="Center"
+                                           LineBreakMode="TailTruncation" />
+                                    <Label Text="{Binding DistanceText}" 
+                                           FontSize="15"
+                                           TextColor="Gray"
+                                           VerticalOptions="Center"
+                                           Margin="5,0,0,0" />
+                                </StackLayout>
+                                
+                                <!-- Chevron Arrow -->
+                                <Label Grid.Column="2" Grid.Row="0"
+                                       Text="{Binding IsExpanded, Converter={StaticResource ExpandCollapseIconConverter}}" 
+                                       FontFamily="FontAwesomeSolid"
+                                       FontSize="16"
+                                       TextColor="#4B0082"
+                                       FontAttributes="Bold"
+                                       HorizontalOptions="End"
+                                       VerticalOptions="Center" />
+                            </Grid>
+                        </Grid>
+                        
+                        <!-- Container for Routes (Visible when expanded) -->
+                        <BoxView HeightRequest="1" Color="#F0F0F0" IsVisible="{Binding IsExpanded}" />
+                        <StackLayout IsVisible="{Binding IsExpanded}" BackgroundColor="White">
+                            <!-- No routes message when no routes have ETAs -->
+                            <Label Text="No buses arriving soon" 
+                                   FontSize="14" 
+                                   TextColor="Gray" 
+                                   HorizontalOptions="Center"
+                                   Margin="0,10,0,10"
+                                   IsVisible="{Binding HasNoVisibleRoutes}" />
+                                   
+                            <StackLayout BindableLayout.ItemsSource="{Binding Routes}" Spacing="0">
+                                <BindableLayout.ItemTemplate>
+                                    <DataTemplate x:DataType="models:TransportRoute">
+                                        <Grid Padding="14,7" BackgroundColor="White" MinimumHeightRequest="56" IsVisible="{Binding HasEta}">
+                                            <Grid.GestureRecognizers>
+                                                <TapGestureRecognizer Tapped="OnNestedRouteTapped" />
+                                            </Grid.GestureRecognizers>
+                                            <Grid ColumnDefinitions="Auto,*,Auto,Auto" RowDefinitions="*">
+                                                <!-- Route Badge - Conditional styling for different transport types -->
+                                                <Border Grid.Column="0" 
+                                                      BackgroundColor="#FFE1E8" 
+                                                      Padding="5,1" 
+                                                      StrokeShape="RoundRectangle 4"
+                                                      VerticalOptions="Center"
+                                                      HeightRequest="26"
+                                                      MinimumWidthRequest="60">
+                                                    <Label Text="{Binding RouteNumber}" 
+                                                           FontSize="20" 
+                                                           FontAttributes="Bold"
+                                                           TextColor="#C71585"
+                                                           HorizontalOptions="Center"
+                                                           VerticalOptions="Center" />
+                                                </Border>
+                                                
+                                                <!-- Destination -->
+                                                <StackLayout Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0" VerticalOptions="Center">
+                                                    <Label Text="{Binding LocalizedDestination}" 
+                                                           FontSize="18"
+                                                           TextColor="Black"
+                                                           VerticalOptions="Center"
+                                                           LineBreakMode="TailTruncation" />
+                                                </StackLayout>
+                                                
+                                                <!-- ETA Indicators -->
+                                                <Border Grid.Column="2"
+                                                      BackgroundColor="#E1F5FE" 
+                                                      Padding="8,1" 
+                                                      StrokeShape="RoundRectangle 12"
+                                                      VerticalOptions="Center"
+                                                      IsVisible="{Binding HasEta}"
+                                                      Margin="3,0">
+                                                    <Label Text="{Binding FirstEtaDisplay}" 
+                                                           FontSize="16" 
+                                                           TextColor="#0288D1"
+                                                           HorizontalOptions="Center"
+                                                           VerticalOptions="Center" />
+                                                </Border>
+                                                
+                                                <!-- Right Chevron -->
+                                                <Label Grid.Column="3"
+                                                       Text="{x:Static local:FontAwesomeIcons.ChevronRight}" 
+                                                       FontFamily="FontAwesomeSolid"
+                                                       FontSize="14"
+                                                       TextColor="Gray"
+                                                       VerticalOptions="Center"
+                                                       Margin="3,0,0,0" />
+                                            </Grid>
+                                        </Grid>
+                                    </DataTemplate>
+                                </BindableLayout.ItemTemplate>
+                            </StackLayout>
+                        </StackLayout>
+                    </StackLayout>
+                </Border>
+            </DataTemplate>
+            
+            <!-- Favorites Template -->
+            <DataTemplate x:Key="FavoriteHeaderTemplate">
+                <Grid Padding="14,8" BackgroundColor="White" ColumnDefinitions="Auto,*,Auto">
+                    <Grid.GestureRecognizers>
+                        <TapGestureRecognizer Tapped="OnFavoriteHeaderTapped" />
+                    </Grid.GestureRecognizers>
+                    <Label Grid.Column="0" Text="⭐" FontSize="22" VerticalOptions="Center" />
+                    <Label Grid.Column="1" Text="Favorite Routes" FontSize="18" FontAttributes="Bold" Margin="8,0,0,0" />
+                    <Label Grid.Column="2" Text="1 routes" FontSize="15" TextColor="Gray" VerticalOptions="Center" />
+                </Grid>
+            </DataTemplate>
+
+            <!-- DataTemplate for TransportRoute (Used when ALL is selected) -->
+            <DataTemplate x:Key="RouteTemplate" x:DataType="models:TransportRoute">
+                <Border Margin="5,3,5,0" Padding="0" StrokeShape="RoundRectangle 8" BackgroundColor="White" Stroke="#EEEEEE" MinimumHeightRequest="56">
+                    <Grid Padding="14,8" BackgroundColor="White">
+                        <Grid.GestureRecognizers>
+                            <TapGestureRecognizer Tapped="OnRouteTapped" CommandParameter="{Binding .}" />
+                        </Grid.GestureRecognizers>
+                        <Grid ColumnDefinitions="Auto,*,Auto,Auto" RowDefinitions="*">
+                            <!-- Company Badge (KMB, MTR, etc) -->
+                            <Border Grid.Column="0"
+                                   BackgroundColor="#FFE1E8" 
+                                   Padding="5,1" 
+                                   StrokeShape="RoundRectangle 4"
+                                   VerticalOptions="Center"
+                                   HeightRequest="26"
+                                   MinimumWidthRequest="60">
+                                <Label Text="{Binding RouteNumber}" 
+                                       FontSize="20" 
+                                       FontAttributes="Bold"
+                                       TextColor="#C71585"
+                                       HorizontalOptions="Center"
+                                       VerticalOptions="Center" />
+                            </Border>
+                            
+                            <!-- Destination with arrow -->
+                            <StackLayout Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0" VerticalOptions="Center">
+                                <Label Text="{Binding LocalizedOrigin}" 
+                                       FontSize="18"
+                                       TextColor="Gray"
+                                       VerticalOptions="Center"
+                                       LineBreakMode="TailTruncation" />
+                                <Label Text="→" TextColor="Gray" FontSize="15" VerticalOptions="Center" />
+                                <Label Text="{Binding LocalizedDestination}" 
+                                       FontSize="18"
+                                       TextColor="Black"
+                                       VerticalOptions="Center"
+                                       LineBreakMode="TailTruncation" />
+                            </StackLayout>
+                            
+                            <!-- Right Chevron -->
+                            <Label Grid.Column="3"
+                                   Text="{x:Static local:FontAwesomeIcons.ChevronRight}" 
+                                   FontFamily="FontAwesomeSolid"
+                                   FontSize="14"
+                                   TextColor="Gray"
+                                   VerticalOptions="Center"
+                                   Margin="3,0,0,0" />
+                        </Grid>
+                    </Grid>
+                </Border>
+            </DataTemplate>
+            
+            <!-- DataTemplateSelector -->
+            <local:MainPageDataTemplateSelector x:Key="MainPageSelector"
+                                              StopGroupTemplate="{StaticResource StopGroupTemplate}"
+                                              RouteTemplate="{StaticResource RouteTemplate}" />
+
+        </ResourceDictionary>
+    </ContentPage.Resources>
+
+    <Grid RowDefinitions="Auto,*,Auto" BackgroundColor="#F8F8F8">
+        <!-- Add tap gesture recognizer to the main content to hide keyboard -->
+        <Grid.GestureRecognizers>
+            <TapGestureRecognizer Tapped="OnBackgroundTapped" />
+        </Grid.GestureRecognizers>
+        
+        <!-- Search Bar with elevated card look -->
+        <Grid Grid.Row="0" BackgroundColor="White" Padding="10,8" ColumnDefinitions="*,Auto">
+            <!-- Search Icon and Input -->
+            <Border Grid.Column="0" 
+                   Padding="5,0" 
+                   StrokeShape="RoundRectangle 8"
+                   Stroke="#EEEEEE"
+                   BackgroundColor="White">
+                <Grid ColumnDefinitions="Auto,*">
+                    <Label Grid.Column="0" 
+                           Text="{x:Static local:FontAwesomeIcons.Search}" 
+                           FontFamily="FontAwesomeSolid"
+                           FontSize="18"
+                           TextColor="#4B0082"
+                           VerticalOptions="Center"
+                           Margin="5,0,0,0" />
+                    
+                    <SearchBar Grid.Column="1"
+                             x:Name="RouteSearchBar"
+                             Placeholder="搜尋巴士路線"
+                             TextChanged="OnSearchTextChanged"
+                             BackgroundColor="White"
+                             TextColor="#4B0082"
+                             PlaceholderColor="Gray"
+                             FontSize="16"
+                             CancelButtonColor="Transparent"
+                             HorizontalOptions="Fill"
+                             Focused="OnSearchBarFocused"
+                             Unfocused="OnSearchBarUnfocused">
+                        <SearchBar.Background>
+                            <SolidColorBrush Color="White" />
+                        </SearchBar.Background>
+                    </SearchBar>
+                </Grid>
+            </Border>
+            
+            <!-- Refresh Button -->
+            <Button Grid.Column="1" 
+                    Text="{x:Static local:FontAwesomeIcons.Refresh}" 
+                    FontFamily="FontAwesomeSolid"
+                    FontSize="18"
+                    TextColor="#4B0082"
+                    BackgroundColor="Transparent"
+                    WidthRequest="36"
+                    HeightRequest="36"
+                    Padding="0"
+                    Command="{Binding RefreshCommand}" />
+        </Grid>
+        
+        <Grid Grid.Row="1" RowDefinitions="Auto,*">
+            <!-- Distance Filter Buttons - Modern pill style -->
+            <Border Grid.Row="0" Padding="5,3" BackgroundColor="White" Stroke="Transparent" Margin="0,1,0,1" StrokeShape="RoundRectangle 8">
+                <Grid ColumnDefinitions="*,*,*,*,*" BackgroundColor="#F5F5F5" Padding="2,2">
+                    <Button Grid.Column="0" Text="100m" CornerRadius="4" 
+                            BackgroundColor="{Binding Distance100mButtonColor}" 
+                            TextColor="{Binding Distance100mTextColor}"
+                            Clicked="OnDistanceFilterClicked" 
+                            FontSize="15"
+                            Padding="0"
+                            HeightRequest="32"
+                            Margin="1,0" />
+                            
+                    <Button Grid.Column="1" Text="200m" CornerRadius="4" 
+                            BackgroundColor="{Binding Distance200mButtonColor}" 
+                            TextColor="{Binding Distance200mTextColor}"
+                            Clicked="OnDistanceFilterClicked" 
+                            FontSize="15"
+                            Padding="0"
+                            HeightRequest="32"
+                            Margin="1,0" />
+                            
+                    <Button Grid.Column="2" Text="400m" CornerRadius="4" 
+                            BackgroundColor="{Binding Distance400mButtonColor}" 
+                            TextColor="{Binding Distance400mTextColor}"
+                            Clicked="OnDistanceFilterClicked" 
+                            FontSize="15"
+                            Padding="0"
+                            HeightRequest="32"
+                            Margin="1,0" />
+                            
+                    <Button Grid.Column="3" Text="600m" CornerRadius="4" 
+                            BackgroundColor="{Binding Distance600mButtonColor}" 
+                            TextColor="{Binding Distance600mTextColor}"
+                            Clicked="OnDistanceFilterClicked" 
+                            FontSize="15"
+                            Padding="0"
+                            HeightRequest="32"
+                            Margin="1,0" />
+                            
+                    <Button Grid.Column="4" Text="All" CornerRadius="4" 
+                            BackgroundColor="{Binding DistanceAllButtonColor}" 
+                            TextColor="{Binding DistanceAllTextColor}"
+                            Clicked="OnDistanceFilterClicked" 
+                            FontSize="15"
+                            Padding="0"
+                            HeightRequest="32"
+                            Margin="1,0" />
+                </Grid>
+            </Border>
+            
+            <!-- Main Content -->
+            <RefreshView Grid.Row="1" IsRefreshing="{Binding IsRefreshing}" Command="{Binding RefreshCommand}">
+                <ScrollView>
+                    <StackLayout Spacing="0">
+                        <!-- Favorite Routes Section - Card style -->
+                        <Border BackgroundColor="White" Margin="5,5,5,0" Padding="0" StrokeShape="RoundRectangle 8" Stroke="#EEEEEE" x:Name="FavoriteRoutesFrame">
+                            <Grid x:Name="FavoriteRoutesGrid">
+                                <!-- Favorite Header -->
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                
+                                <!-- Use the template directly -->
+                                <Grid Grid.Row="0" Padding="14,8" BackgroundColor="White" ColumnDefinitions="Auto,*,Auto">
+                                    <Grid.GestureRecognizers>
+                                        <TapGestureRecognizer Tapped="OnFavoriteHeaderTapped" />
+                                    </Grid.GestureRecognizers>
+                                    <Label Grid.Column="0" Text="⭐" FontSize="22" VerticalOptions="Center" />
+                                    <Label Grid.Column="1" Text="Favorite Routes" FontSize="18" FontAttributes="Bold" Margin="8,0,0,0" />
+                                    <Label Grid.Column="2" Text="1 routes" FontSize="15" TextColor="Gray" VerticalOptions="Center" />
+                                </Grid>
+                                
+                                <!-- Example Favorite Route - In a real app would be dynamic -->
+                                <Grid Grid.Row="1" Padding="14,8" ColumnDefinitions="Auto,*,Auto,Auto" BackgroundColor="White">
+                                    <Grid.GestureRecognizers>
+                                        <TapGestureRecognizer Tapped="OnRouteTapped"/>
+                                    </Grid.GestureRecognizers>
+                                    
+                                    <!-- Route Badge for MTR -->
+                                    <Border Grid.Column="0"
+                                           BackgroundColor="#F2E6FF" 
+                                           Padding="5,1" 
+                                           StrokeShape="RoundRectangle 4"
+                                           VerticalOptions="Center"
+                                           HeightRequest="26"
+                                           MinimumWidthRequest="60">
+                                        <Label Text="506" 
+                                               FontSize="20" 
+                                               FontAttributes="Bold"
+                                               TextColor="#9C27B0"
+                                               HorizontalOptions="Center"
+                                               VerticalOptions="Center" />
+                                    </Border>
+                                    
+                                    <!-- Destination -->
+                                    <StackLayout Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0" VerticalOptions="Center">
+                                        <Label Text="屯門碼頭" FontSize="18" TextColor="Black" VerticalOptions="Center"/>
+                                    </StackLayout>
+                                    
+                                    <!-- Arrived indicator -->
+                                    <Border Grid.Column="2"
+                                           BackgroundColor="#E8F5E9" 
+                                           Padding="8,1" 
+                                           StrokeShape="RoundRectangle 12"
+                                           VerticalOptions="Center"
+                                           Margin="3,0">
+                                        <Label Text="已到達" 
+                                               FontSize="16" 
+                                               TextColor="#388E3C"
+                                               HorizontalOptions="Center"
+                                               VerticalOptions="Center" />
+                                    </Border>
+                                    
+                                    <!-- Right chevron -->
+                                    <Label Grid.Column="3"
+                                           Text="{x:Static local:FontAwesomeIcons.ChevronRight}" 
+                                           FontFamily="FontAwesomeSolid"
+                                           FontSize="14"
+                                           TextColor="Gray"
+                                           VerticalOptions="Center"
+                                           Margin="3,0,0,0" />
+                                </Grid>
+                            </Grid>
+                        </Border>
+                        
+                        <!-- Main Collectionview for data-bound routes -->
+                        <CollectionView x:Name="RoutesCollection"
+                                      ItemsSource="{Binding Routes}"
+                                      ItemTemplate="{StaticResource MainPageSelector}" 
+                                      SelectionMode="None"
+                                      MinimumHeightRequest="56"
+                                      HeightRequest="-1"
+                                      RemainingItemsThreshold="5"
+                                      RemainingItemsThresholdReached="OnRemainingItemsThresholdReached"
+                                      ItemsUpdatingScrollMode="KeepItemsInView"
+                                      Scrolled="OnCollectionViewScrolled"
+                                      Margin="5,5,5,0">
+                            <CollectionView.EmptyView>
+                                <Grid WidthRequest="200" HeightRequest="100" HorizontalOptions="Center" VerticalOptions="Center">
+                                    <StackLayout VerticalOptions="Center" HorizontalOptions="Center" Padding="20">
+                                        <Label x:Name="NoRoutesLabel"
+                                               Text="No routes found." 
+                                               FontSize="18" 
+                                               HorizontalTextAlignment="Center" />
+                                        <Button x:Name="RefreshButton"
+                                               Command="{Binding RefreshCommand}" 
+                                               BackgroundColor="#4B0082"
+                                               TextColor="White"
+                                               HorizontalOptions="Center" 
+                                               Text="Refresh"
+                                               FontSize="16"
+                                               Margin="0,10,0,0"
+                                               CornerRadius="16"
+                                               Padding="12,5">
+                                        </Button>
+                                    </StackLayout>
+                                </Grid>
+                            </CollectionView.EmptyView>
+                            <CollectionView.ItemsLayout>
+                                <LinearItemsLayout Orientation="Vertical" ItemSpacing="2" />
+                            </CollectionView.ItemsLayout>
+                        </CollectionView>
+                    </StackLayout>
+                </ScrollView>
+            </RefreshView>
+        </Grid>
+        
+        <!-- Loading Grid -->
+        <Grid x:Name="LoadingGrid" Grid.Row="2" IsVisible="{Binding IsDataLoading}" Padding="10,3" VerticalOptions="End" HorizontalOptions="Fill" BackgroundColor="White">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <ProgressBar Grid.Row="0"
+                      Progress="{Binding DownloadProgress}"
+                      ProgressColor="#4B0082"
+                      HorizontalOptions="Fill"
+                      HeightRequest="10" />
+            <Label Grid.Row="1"
+                 Text="{Binding DownloadStatusMessage}"
+                 FontSize="12"
+                 TextColor="Gray"
+                 HorizontalOptions="Center"
+                 Margin="0,5,0,0" />
+        </Grid>
+
+        <!-- Custom Keyboard -->
+        <Grid x:Name="CustomKeyboard" 
+              Grid.Row="2" 
+              IsVisible="{Binding KeyboardManager.IsKeyboardVisible}"
+              BackgroundColor="#f0f0f0"
+              Padding="8"
+              RowSpacing="6"
+              ColumnSpacing="6"
+              HeightRequest="{Binding KeyboardManager.CalculatedKeyboardHeight}"
+              HorizontalOptions="FillAndExpand"
+              VerticalOptions="Start">
+            
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="3*" />
+                <ColumnDefinition Width="2*" />
+            </Grid.ColumnDefinitions>
+            
+            <!-- Number Buttons -->
+            <Grid Grid.Column="0"
+                  x:Name="NumberButtonsGrid"
+                  RowDefinitions="*,*,*,*"
+                  ColumnDefinitions="*,*,*"
+                  RowSpacing="6"
+                  ColumnSpacing="6"
+                  HorizontalOptions="FillAndExpand"
+                  VerticalOptions="FillAndExpand">
+                
+                <!-- Number Buttons 1-9, Delete, 0, Clear -->
+                <Button Grid.Row="0" Grid.Column="0" 
+                        Text="1" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey1Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key1BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key1TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="0" Grid.Column="1" 
+                        Text="2" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey2Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key2BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key2TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="0" Grid.Column="2" 
+                        Text="3" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey3Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key3BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key3TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="1" Grid.Column="0" 
+                        Text="4" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey4Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key4BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key4TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="1" Grid.Column="1" 
+                        Text="5" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey5Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key5BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key5TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="1" Grid.Column="2" 
+                        Text="6" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey6Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key6BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key6TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="2" Grid.Column="0" 
+                        Text="7" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey7Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key7BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key7TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="2" Grid.Column="1" 
+                        Text="8" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey8Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key8BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key8TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="2" Grid.Column="2" 
+                        Text="9" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey9Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key9BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key9TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="3" Grid.Column="0" 
+                        Text="⌫" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        BackgroundColor="{Binding DeleteButtonBackgroundColor}"
+                        TextColor="{Binding DeleteButtonTextColor}"
+                        Clicked="OnDeletePressed" />
+                
+                <Button Grid.Row="3" Grid.Column="1" 
+                        Text="0" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        IsEnabled="{Binding KeyboardManager.IsKey0Enabled}"
+                        BackgroundColor="{Binding KeyboardManager.Key0BackgroundColor}"
+                        TextColor="{Binding KeyboardManager.Key0TextColor}"
+                        Clicked="OnKeyPressed" />
+                
+                <Button Grid.Row="3" Grid.Column="2" 
+                        Text="C" 
+                        FontSize="20"
+                        FontAttributes="Bold"
+                        Margin="2"
+                        BackgroundColor="{Binding ClearButtonBackgroundColor}"
+                        TextColor="{Binding ClearButtonTextColor}"
+                        Clicked="OnClearPressed" />
+            </Grid>
+            
+            <!-- Alphabet Buttons (Scrollable) -->
+            <ScrollView Grid.Column="1" 
+                       x:Name="AlphabetScrollView"
+                       HorizontalOptions="FillAndExpand"
+                       VerticalOptions="FillAndExpand"
+                       MaximumHeightRequest="{Binding KeyboardManager.CalculatedKeyboardHeight}"
+                       Orientation="Vertical">
+                <FlexLayout x:Name="AlphabetButtonsGrid"
+                          BindableLayout.ItemsSource="{Binding KeyboardManager.AvailableAlphabetKeys}"
+                          Wrap="Wrap"
+                          JustifyContent="SpaceEvenly"
+                          AlignItems="Center"
+                          HorizontalOptions="Fill">
+                    <BindableLayout.ItemTemplate>
+                        <DataTemplate x:DataType="local:AlphabetKeyModel">
+                            <Button Text="{Binding Key}"
+                                  IsEnabled="{Binding IsEnabled}"
+                                  BackgroundColor="{Binding BackgroundColor}"
+                                  TextColor="{Binding TextColor}"
+                                  FontSize="14"
+                                  FontAttributes="Bold"
+                                  Margin="2"
+                                  WidthRequest="{Binding Source={RelativeSource AncestorType={x:Type local:MainPage}}, Path=KeyboardManager.CalculatedAlphabetButtonWidth}"
+                                  HeightRequest="28"
+                                  CommandParameter="{Binding Key}"
+                                  Clicked="OnAlphabetKeyPressed" />
+                        </DataTemplate>
+                    </BindableLayout.ItemTemplate>
+                </FlexLayout>
+            </ScrollView>
+        </Grid>
+    </Grid>
+
+</ContentPage>

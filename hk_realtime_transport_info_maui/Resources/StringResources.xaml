@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ResourceDictionary xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+                    x:Class="hk_realtime_transport_info_maui.Resources.StringResources">
+    
+    <!-- English Strings (Default) -->
+    <x:String x:Key="AppTitle">Route Information</x:String>
+    <x:String x:Key="AllRoutes">All Routes</x:String>
+    <x:String x:Key="From">From: {0}</x:String>
+    <x:String x:Key="To">To: {0}</x:String>
+    <x:String x:Key="RouteDetails">Route Details</x:String>
+    <x:String x:Key="Route">Route: {0}</x:String>
+    <x:String x:Key="Name">Name: {0}</x:String>
+    <x:String x:Key="Close">Close</x:String>
+    <x:String x:Key="NoRoutesFound">No routes found.</x:String>
+    <x:String x:Key="Refresh">Refresh</x:String>
+    
+</ResourceDictionary> 
