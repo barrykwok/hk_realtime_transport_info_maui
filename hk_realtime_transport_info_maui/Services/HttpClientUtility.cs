@@ -816,7 +816,7 @@ namespace hk_realtime_transport_info_maui.Services
     /// </summary>
     public class HttpClientUtilityOptions
     {
-        public int MaxConcurrentRequests { get; set; } = 10;
+        public int MaxConcurrentRequests { get; set; } = 8;
         public int MaxRetryAttempts { get; set; } = 3;
         public int InitialRetryDelayMs { get; set; } = 1000;
         public int MaxRetryDelayMs { get; set; } = 15000;

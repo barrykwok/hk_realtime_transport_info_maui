@@ -126,7 +126,7 @@ public static class MauiProgram
 		});
 		builder.Services.AddSingleton<HttpClientUtilityOptions>(sp => new HttpClientUtilityOptions
 		{
-			MaxConcurrentRequests = 10,
+			MaxConcurrentRequests = 8,
 			MaxRetryAttempts = 3,
 			InitialRetryDelayMs = 1000,
 			MaxRetryDelayMs = 15000,
