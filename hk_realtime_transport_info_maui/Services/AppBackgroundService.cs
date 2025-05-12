@@ -104,27 +104,27 @@ namespace hk_realtime_transport_info_maui.Services
         }
         
         /// <summary>
-        /// Runs the database optimization
+        /// Runs database maintenance
         /// </summary>
         private void RunDatabaseOptimization()
         {
             try
             {
-                _logger?.LogInformation("Starting scheduled database optimization");
+                _logger?.LogInformation("Starting scheduled database maintenance");
                 
-                // Run the analysis and optimization
+                // Run database maintenance (formerly analysis and optimization)
                 _databaseService.AnalyzeAndOptimizeDatabase();
                 
-                _logger?.LogInformation("Scheduled database optimization completed");
+                _logger?.LogInformation("Scheduled database maintenance completed");
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Error optimizing database in background");
+                _logger?.LogError(ex, "Error during database maintenance in background");
             }
         }
         
         /// <summary>
-        /// Manually triggers database optimization
+        /// Manually triggers database maintenance
         /// </summary>
         public async Task TriggerDatabaseOptimizationAsync()
         {

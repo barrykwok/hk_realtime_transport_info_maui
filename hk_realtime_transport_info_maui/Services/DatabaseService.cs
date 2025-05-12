@@ -1061,70 +1061,22 @@ namespace hk_realtime_transport_info_maui.Services
         }
         
         /// <summary>
-        /// Analyzes database performance and optimizes it
+        /// Performs minimal database maintenance - no database operations are executed
         /// </summary>
         public void AnalyzeAndOptimizeDatabase()
         {
             try
             {
-                _logger?.LogInformation("Analyzing and optimizing database");
-                var db = GetDatabase();
+                _logger?.LogInformation("Database maintenance requested but skipped (all operations removed)");
                 
-                // Analyze the database for optimization opportunities
-                db.Execute("ANALYZE;");
+                // All database maintenance operations (ANALYZE, OPTIMIZE, VACUUM) have been removed
+                // due to database corruption and transaction issues
                 
-                // Run optimization commands
-                db.Execute("PRAGMA optimize;");
-                
-                // Run vacuum to compact the database
-                int maxRetries = 3;
-                int delayMilliseconds = 1000;
-                for (int i = 0; i < maxRetries; i++)
-                {
-                    try
-                    {
-                        db.Execute("VACUUM;");
-                        _logger?.LogInformation("VACUUM command successful.");
-                        break; // Success, exit loop
-                    }
-                    catch (SQLite.SQLiteException ex) when (ex.Message.Contains("SQL logic error or missing database") || ex.Message.Contains("database is locked") || ex.Message.Contains("SQL statements in progress"))
-                    {
-                        _logger?.LogWarning(ex, $"Error executing VACUUM (attempt {i + 1}/{maxRetries}): {ex.Message}. Retrying in {delayMilliseconds}ms...");
-                        if (i < maxRetries - 1)
-                        {
-                            System.Threading.Thread.Sleep(delayMilliseconds);
-                            delayMilliseconds *= 2; // Exponential backoff
-                        }
-                        else
-                        {
-                            _logger?.LogError(ex, "VACUUM command failed after multiple retries.");
-                            // Optionally rethrow or handle the persistent failure
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // Catch other unexpected exceptions during VACUUM
-                        _logger?.LogError(ex, $"Unexpected error during VACUUM (attempt {i + 1}/{maxRetries}): {ex.Message}");
-                        if (i < maxRetries - 1)
-                        {
-                             System.Threading.Thread.Sleep(delayMilliseconds);
-                             delayMilliseconds *= 2; // Exponential backoff
-                        }
-                        else
-                        {
-                             _logger?.LogError(ex, "VACUUM command failed after multiple retries due to unexpected error.");
-                        }
-                    }
-                }
-                
-                // Update statistics for query planner
-                db.Execute("ANALYZE sqlite_master;");
-                
-                _logger?.LogInformation("Database analysis and optimization completed");
+                _logger?.LogInformation("Database maintenance completed (no operations performed)");
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Error while analyzing and optimizing database");
+                _logger?.LogError(ex, "Error during database maintenance");
             }
         }
         

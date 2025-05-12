@@ -263,14 +263,14 @@ public partial class App : Application
 					// Optimize the database if data was updated
 					if (dataWasUpdated)
 					{
-						// Run database optimization on a background thread
+						// Run database maintenance on a background thread
 						Task.Run(() => {
 							try {
-								_logger.LogInformation("Running database optimization after data update");
+								_logger.LogInformation("Running database maintenance after data update");
 								_databaseService.AnalyzeAndOptimizeDatabase();
 							}
 							catch (Exception ex) {
-								_logger.LogError(ex, "Error optimizing database after data update");
+								_logger.LogError(ex, "Error during database maintenance after data update");
 							}
 						});
 					}
