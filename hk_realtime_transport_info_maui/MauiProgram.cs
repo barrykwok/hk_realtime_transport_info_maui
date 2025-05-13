@@ -83,22 +83,29 @@ public static class MauiProgram
 		// Register exception handling service
 		builder.Services.AddSingleton<ExceptionHandlingService>();
 
-		// Register database service
-		builder.Services.AddSingleton<DatabaseService>(sp => 
-			new DatabaseService(sp.GetService<ILogger<DatabaseService>>()));
+		// Register LiteDbService
+		builder.Services.AddSingleton<LiteDbService>(sp => 
+			new LiteDbService(sp.GetService<ILogger<LiteDbService>>()));
 		
 		// Register transport data services
-		builder.Services.AddSingleton<KmbDataService>();
+		builder.Services.AddSingleton<KmbDataService>(sp =>
+		{
+			var httpClientUtility = sp.GetRequiredService<HttpClientUtility>();
+			var liteDbService = sp.GetRequiredService<LiteDbService>();
+			var logger = sp.GetRequiredService<ILogger<KmbDataService>>();
+			
+			return new KmbDataService(liteDbService, httpClientUtility, logger);
+		});
 		
 		// Register ETA service
 		builder.Services.AddSingleton<EtaService>(sp => 
 		{
 			var httpClient = sp.GetRequiredService<HttpClient>();
-			var databaseService = sp.GetRequiredService<DatabaseService>();
+			var liteDbService = sp.GetRequiredService<LiteDbService>();
 			var logger = sp.GetRequiredService<ILogger<EtaService>>();
 			var cacheService = sp.GetRequiredService<CacheService>();
 			
-			return new EtaService(httpClient, databaseService, logger, cacheService);
+			return new EtaService(httpClient, liteDbService, logger, cacheService);
 		});
 		
 		// Register HttpClient for API services
@@ -126,7 +133,7 @@ public static class MauiProgram
 		});
 		builder.Services.AddSingleton<HttpClientUtilityOptions>(sp => new HttpClientUtilityOptions
 		{
-			MaxConcurrentRequests = 8,
+			MaxConcurrentRequests = 4,
 			MaxRetryAttempts = 3,
 			InitialRetryDelayMs = 1000,
 			MaxRetryDelayMs = 15000,
@@ -298,8 +305,8 @@ public static class MauiProgram
 				if (services != null)
 				{
 					// Get the database service and dispose it
-					var databaseService = services.GetService<DatabaseService>();
-					databaseService?.Dispose();
+					var liteDbService = services.GetService<LiteDbService>();
+					liteDbService?.Dispose();
 				}
 			}
 		}

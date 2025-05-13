@@ -135,8 +135,19 @@ namespace hk_realtime_transport_info_maui
             {
                 if (!IsExpanded) return false;
                 
-                // Use the pre-calculated count for faster performance
-                return _routesWithEtaCount == 0;
+                // Check if any routes explicitly have ETAs, allowing routes without ETAs to be visible
+                if (_routes != null && _routes.Any())
+                {
+                    var visibleRoutesCount = _routes.Count(r => r != null);
+                    return visibleRoutesCount == 0;
+                }
+                else if (_routesList != null && _routesList.Any())
+                {
+                    var visibleRoutesCount = _routesList.Count(r => r != null);
+                    return visibleRoutesCount == 0;
+                }
+                
+                return true;
             }
         }
 
@@ -187,5 +198,13 @@ namespace hk_realtime_transport_info_maui
 
         protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = "") =>
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+            
+        /// <summary>
+        /// Public method to notify property changed for external callers
+        /// </summary>
+        public void NotifyPropertyChanged(string propertyName)
+        {
+            OnPropertyChanged(propertyName);
+        }
     }
 } 

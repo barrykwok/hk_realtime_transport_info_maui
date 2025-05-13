@@ -107,74 +107,6 @@ namespace hk_realtime_transport_info_maui.Services
             _logger.LogError(ex, errorMessage);
         }
 
-        /// <summary>
-        /// Attempts to recover from SQLite errors.
-        /// </summary>
-        private void AttemptSQLiteRecovery()
-        {
-            try
-            {
-                _logger.LogInformation("Attempting to recover from SQLite error");
-                
-                // Get the database service and perform recovery operations
-                if (IPlatformApplication.Current?.Services != null)
-                {
-                    var databaseService = IPlatformApplication.Current.Services.GetService<DatabaseService>();
-                    if (databaseService != null)
-                    {
-                        // Detect if this is corruption or other SQLite issue
-                        bool isCorrupted = false;
-                        
-                        // Common SQLite error messages that indicate corruption
-                        string[] corruptionIndicators = new string[] 
-                        { 
-                            "database disk image is malformed",
-                            "database is corrupt",
-                            "database disk header is malformed",
-                            "malformed database schema",
-                            "index corruption",
-                            "database corruption"
-                        };
-                        
-                        // Check if any indicators are in the exception messages
-                        if (LastException != null && corruptionIndicators.Any(indicator => 
-                            LastException.Message.Contains(indicator) || 
-                            (LastException.InnerException != null && LastException.InnerException.Message.Contains(indicator))))
-                        {
-                            _logger.LogWarning("Database corruption detected, attempting repair");
-                            isCorrupted = true;
-                        }
-                        
-                        // Use different recovery approaches depending on the issue type
-                        if (isCorrupted)
-                        {
-                            // For corruption, try to repair database
-                            bool repairSuccessful = databaseService.CheckAndRepairDatabase();
-                            
-                            if (repairSuccessful)
-                            {
-                                _logger.LogInformation("Database repair successful");
-                            }
-                            else
-                            {
-                                _logger.LogError("Database repair failed");
-                            }
-                        }
-                        else
-                        {
-                            // For non-corruption issues, just try reconnecting
-                            databaseService.CloseAndReopenConnection();
-                            _logger.LogInformation("SQLite connection reset successfully");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to recover from SQLite error");
-            }
-        }
-        
         // Store the last exception for diagnostics
         private Exception? LastException { get; set; }
         
@@ -194,15 +126,7 @@ namespace hk_realtime_transport_info_maui.Services
                 // Log the exception
                 _logger.LogCritical(ex, "Unhandled exception caught: {Message}", ex.Message);
                 
-                // Determine if this is a SQLite error
-                bool isSQLiteError = IsSQLiteException(ex);
                 string errorMessage = GetUserFriendlyErrorMessage(ex);
-                
-                // If it's a SQLite error, try to recover
-                if (isSQLiteError)
-                {
-                    AttemptSQLiteRecovery();
-                }
                 
                 // Show UI message if requested
                 if (showUI)
@@ -221,29 +145,14 @@ namespace hk_realtime_transport_info_maui.Services
         }
         
         /// <summary>
-        /// Determines if an exception is related to SQLite.
-        /// </summary>
-        /// <param name="ex">The exception to check.</param>
-        /// <returns>True if the exception is SQLite-related, false otherwise.</returns>
-        private bool IsSQLiteException(Exception ex)
-        {
-            // Check the exception type or message for SQLite-specific information
-            return ex.GetType().Name.Contains("SQLite") || 
-                   ex.Message.Contains("SQLite") ||
-                   (ex.InnerException != null && 
-                    (ex.InnerException.GetType().Name.Contains("SQLite") || 
-                     ex.InnerException.Message.Contains("SQLite")));
-        }
-        
-        /// <summary>
         /// Gets a user-friendly error message for an exception.
         /// </summary>
         /// <param name="ex">The exception to get a message for.</param>
         /// <returns>A user-friendly error message.</returns>
         private string GetUserFriendlyErrorMessage(Exception ex)
         {
-            // SQLite errors
-            if (IsSQLiteException(ex))
+            // Database errors - now more generic for any database type
+            if (ex.Message.Contains("database") || ex.Message.Contains("Database"))
             {
                 return "A database error occurred. The app will try to recover automatically.";
             }

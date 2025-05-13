@@ -3,8 +3,8 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
 using System.Runtime.CompilerServices;
-using SQLite;
 using NGeoHash;
+using LiteDB;
 
 namespace hk_realtime_transport_info_maui.Models
 {
@@ -14,37 +14,34 @@ namespace hk_realtime_transport_info_maui.Models
     /// </summary>
     public class TransportStop : INotifyPropertyChanged
     {
-        [PrimaryKey]
-        public string Id { get; set; }
+        [BsonId]
+        public string Id { get; set; } = string.Empty;
         
-        [Indexed]
         public string StopId { get; set; } = string.Empty;
+        public string BusStopId { get; set; } = string.Empty;
         
         // Operator will be assigned by the data service
-        [Indexed]
         public TransportOperator Operator { get; set; }
         
         /// <summary>
         /// Unique key composed of Operator + StopId
         /// Used for indexing and faster searching
         /// </summary>
-        [Indexed]
         public string Key => $"{Operator}_{StopId}";
         
+        public string Name { get; set; } = string.Empty;
+        public string NameChi { get; set; } = string.Empty;
+        public string NameEng { get; set; } = string.Empty;
+        
+        // Properties required by existing code
         public string NameEn { get; set; } = string.Empty;
-        
         public string NameZh { get; set; } = string.Empty;
-        
-        // Traditional Chinese name
         public string NameZhHant { get; set; } = string.Empty;
-        
-        // Simplified Chinese name
         public string NameZhHans { get; set; } = string.Empty;
         
         /// <summary>
         /// Gets the localized name based on current culture
         /// </summary>
-        [Ignore]
         public string LocalizedName
         {
             get
@@ -60,38 +57,36 @@ namespace hk_realtime_transport_info_maui.Models
             }
         }
         
-        [Indexed]
-        public double Latitude { get; set; }
+        public string Area { get; set; } = string.Empty;
+        public string District { get; set; } = string.Empty;
         
-        [Indexed]
+        public double Latitude { get; set; }
         public double Longitude { get; set; }
         
-        [Indexed]
+        // GeoHash properties for faster location-based queries
         public string GeoHash6 { get; set; } = string.Empty;
-        
-        [Indexed]
         public string GeoHash7 { get; set; } = string.Empty;
-        
-        [Indexed]
         public string GeoHash8 { get; set; } = string.Empty;
-        
         public string GeoHash9 { get; set; } = string.Empty;
+        
+        // Sequence number in route (set when used in route context)
+        public int Sequence { get; set; }
+        
+        // Distance from user's current location (set during nearby stop searches)
+        public double DistanceFromUser { get; set; }
+        
+        [BsonIgnore]
+        public List<TransportRoute> Routes { get; set; } = new List<TransportRoute>();
+        
+        [BsonIgnore]
+        public List<TransportEta> Etas { get; set; } = new List<TransportEta>();
         
         // Last time this stop was updated
         public DateTime LastUpdated { get; set; }
         
-        // Routes that have this stop (for UI purposes only)
-        [Ignore]
-        public List<string> Routes { get; set; } = new List<string>();
-        
-        // Sequence number for display purposes (populated from RouteStopRelation)
-        [Ignore]
-        public int Sequence { get; set; }
-        
         // First estimated arrival time for display in UI
         private string _firstEta = string.Empty;
         
-        [Ignore]
         public string FirstEta
         {
             get => _firstEta;

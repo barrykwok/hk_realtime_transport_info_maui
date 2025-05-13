@@ -7,13 +7,13 @@ namespace hk_realtime_transport_info_maui;
 
 public partial class AppShell : Shell
 {
-	private readonly DatabaseService _databaseService;
+	private readonly LiteDbService _databaseService;
 	private readonly KmbDataService _kmbDataService;
 	private readonly EtaService _etaService;
 	private readonly ILogger<MainPage> _logger;
 	private MainPage _mainPage;
 
-	public AppShell(DatabaseService databaseService, KmbDataService kmbDataService, EtaService etaService, ILogger<MainPage> logger)
+	public AppShell(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, ILogger<MainPage> logger)
 	{
 		// Manually initialize components from XAML
 		InitializeComponent();

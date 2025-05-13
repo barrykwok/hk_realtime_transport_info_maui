@@ -13,7 +13,7 @@ public partial class App : Application
 {
 	private readonly KmbDataService _kmbDataService;
 	private readonly ILogger<App> _logger;
-	private readonly DatabaseService _databaseService;
+	private readonly LiteDbService _databaseService;
 	private static readonly ConcurrentDictionary<string, Action> _dataReadyCallbacks = new();
 	private bool _dataInitialized;
 	private AppBackgroundService? _backgroundService;
@@ -39,7 +39,7 @@ public partial class App : Application
 		{ "Refresh", "Refresh" }
 	};
 
-	public App(KmbDataService kmbDataService, ILogger<App> logger, DatabaseService databaseService)
+	public App(KmbDataService kmbDataService, ILogger<App> logger, LiteDbService databaseService)
 	{
 		// Initialize components
 		InitializeComponent();
@@ -210,35 +210,33 @@ public partial class App : Application
 
 	protected override Window CreateWindow(IActivationState? activationState)
 	{
+		// Get the necessary services for the window
 		var services = IPlatformApplication.Current?.Services;
 		if (services == null)
 		{
-			_logger.LogError("Failed to get services from IPlatformApplication.Current");
-			throw new InvalidOperationException("IPlatformApplication.Current.Services is null");
+			return base.CreateWindow(activationState);
 		}
 		
-		var logger = services.GetService<ILogger<MainPage>>();
-		if (logger == null)
+		try
 		{
-			_logger.LogWarning("ILogger<MainPage> not found in service provider, creating default logger");
+			// Get ETA service from DI
+			var etaService = services.GetService<EtaService>();
 			var loggerFactory = services.GetService<ILoggerFactory>();
-			logger = loggerFactory?.CreateLogger<MainPage>();
-		}
+			var logger = loggerFactory?.CreateLogger<MainPage>();
 		
-		if (logger == null)
+			if (etaService == null || logger == null)
 		{
-			_logger.LogError("Failed to create logger for MainPage");
-			throw new InvalidOperationException("Failed to create logger for MainPage");
+				return base.CreateWindow(activationState);
+			}
+			
+			// Create a custom window with our own AppShell
+			return new Window(new AppShell(_databaseService, _kmbDataService, etaService, logger));
 		}
-		
-		var etaService = services.GetService<EtaService>();
-		if (etaService == null)
+		catch (Exception ex)
 		{
-			_logger.LogError("Failed to get EtaService from service provider");
-			throw new InvalidOperationException("EtaService not found in service provider");
+			_logger?.LogError(ex, "Error creating custom window");
+			return base.CreateWindow(activationState);
 		}
-		
-		return new Window(new AppShell(_databaseService, _kmbDataService, etaService, logger));
 	}
 	
 	private async Task InitializeDataAsync(bool forceRefresh = false)
@@ -449,5 +447,20 @@ public partial class App : Application
 			return value;
 		}
 		return defaultValue;
+	}
+
+	private void PerformMaintenance()
+	{
+		try
+		{
+			// Run database maintenance
+			_databaseService.AnalyzeAndOptimizeDatabase();
+			
+			// Other maintenance tasks
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error in maintenance");
+		}
 	}
 }

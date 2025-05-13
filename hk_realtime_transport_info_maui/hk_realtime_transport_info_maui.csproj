@@ -65,12 +65,10 @@
 		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="9.0.4" />
 		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="9.0.0" />
-		<PackageReference Include="sqlite-net-pcl" Version="1.8.116" />
-		<PackageReference Include="SQLitePCLRaw.bundle_green" Version="2.1.8" />
 		<PackageReference Include="NGeoHash" Version="1.2.0" />
-		<PackageReference Include="SQLiteNetExtensions" Version="2.1.0" />
 		<PackageReference Include="Syncfusion.Maui.Buttons" Version="29.1.40" />
 		<PackageReference Include="Syncfusion.Maui.Expander" Version="29.1.40" />
+		<PackageReference Include="LiteDB" Version="5.0.17" />
 	</ItemGroup>
 
 </Project>

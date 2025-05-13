@@ -73,7 +73,7 @@
                             <StackLayout BindableLayout.ItemsSource="{Binding Routes}" Spacing="0">
                                 <BindableLayout.ItemTemplate>
                                     <DataTemplate x:DataType="models:TransportRoute">
-                                        <Grid Padding="14,7" BackgroundColor="White" MinimumHeightRequest="56" IsVisible="{Binding HasEta}">
+                                        <Grid Padding="14,7" BackgroundColor="White" MinimumHeightRequest="56">
                                             <Grid.GestureRecognizers>
                                                 <TapGestureRecognizer Tapped="OnNestedRouteTapped" />
                                             </Grid.GestureRecognizers>

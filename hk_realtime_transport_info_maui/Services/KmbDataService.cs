@@ -7,7 +7,6 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using hk_realtime_transport_info_maui.Models;
-using SQLite;
 using Microsoft.Extensions.Logging;
 using NGeoHash;
 using System.Collections.Concurrent;
@@ -32,7 +31,7 @@ namespace hk_realtime_transport_info_maui.Services
     
     public class KmbDataService
     {
-        private readonly DatabaseService _databaseService;
+        private readonly LiteDbService _databaseService;
         private readonly HttpClientUtility _httpClient;
         private readonly ILogger<KmbDataService> _logger;
         private readonly JsonSerializerOptions _jsonOptions;
@@ -88,7 +87,7 @@ namespace hk_realtime_transport_info_maui.Services
         // Cache expiration timespan - only recheck every few minutes
         private static readonly TimeSpan _freshnessCheckExpiration = TimeSpan.FromMinutes(10);
         
-        public KmbDataService(DatabaseService databaseService, HttpClientUtility httpClient, ILogger<KmbDataService> logger)
+        public KmbDataService(LiteDbService databaseService, HttpClientUtility httpClient, ILogger<KmbDataService> logger)
         {
             _databaseService = databaseService;
             _httpClient = httpClient;
@@ -128,43 +127,24 @@ namespace hk_realtime_transport_info_maui.Services
             
             try
             {
-                var db = _databaseService.GetDatabase();
+                // Get all records directly from LiteDb since the DatabaseService has been migrated
+                var routes = _databaseService.GetAllRecords<TransportRoute>("TransportRoutes")
+                    .Where(r => r.Operator == operatorType)
+                    .ToList();
                 
-                // Check if there are any routes for this operator
-                var query = "SELECT * FROM TransportRoute WHERE Operator = ? ORDER BY LastUpdated DESC LIMIT 1";
-                var routes = db.Query<TransportRoute>(query, (int)operatorType);
                 bool dataExists = routes.Count > 0;
                 
                 if (!dataExists)
                 {
-                    // Double-check with a count query which may be more reliable
-                    try 
-                    {
-                        int count = db.ExecuteScalar<int>("SELECT COUNT(*) FROM TransportRoute WHERE Operator = ?", (int)operatorType);
-                        dataExists = count > 0;
-                        
-                        if (dataExists)
-                        {
-                            _logger?.LogWarning("First query showed no data but count query found {count} routes", count);
-                        }
-                    }
-                    catch 
-                    {
-                        // If this query fails too, continue with the original result
-                    }
+                    _logger?.LogInformation("No data found for operator {operator}", operatorType);
                     
-                    if (!dataExists)
-                    {
-                        _logger?.LogInformation("No data found for operator {operator}", operatorType);
-                        
-                        // Store in cache
-                        _dataFreshnessCache[operatorType] = (false, false, DateTime.UtcNow);
-                        return (false, false);
-                    }
+                    // Store in cache
+                    _dataFreshnessCache[operatorType] = (false, false, DateTime.UtcNow);
+                    return (false, false);
                 }
                 
                 // Check data freshness (using the newest route's timestamp)
-                var newestRoute = routes.FirstOrDefault();
+                var newestRoute = routes.OrderByDescending(r => r.LastUpdated).FirstOrDefault();
                 if (newestRoute == null)
                 {
                     _logger?.LogWarning("No routes found for {operator} despite previous check", operatorType);
@@ -183,42 +163,6 @@ namespace hk_realtime_transport_info_maui.Services
                 // Store result in cache
                 _dataFreshnessCache[operatorType] = (dataExists, dataIsFresh, DateTime.UtcNow);
                 return (dataExists, dataIsFresh);
-            }
-            catch (SQLiteException ex) when (ex.Message.Contains("malformed") || ex.Message.Contains("corrupt"))
-            {
-                _logger?.LogError(ex, "Database corruption detected during freshness check for {operator}", operatorType);
-                
-                // Try to repair the database and retry once
-                try
-                {
-                    var databaseService = IPlatformApplication.Current?.Services?.GetService<DatabaseService>();
-                    if (databaseService != null)
-                    {
-                        bool repaired = databaseService.CheckAndRepairDatabase();
-                        if (repaired)
-                        {
-                            _logger?.LogInformation("Database repaired, retrying freshness check");
-                            
-                            // Retry the query after repair
-                            var db = _databaseService.GetDatabase();
-                            int count = db.ExecuteScalar<int>("SELECT COUNT(*) FROM TransportRoute WHERE Operator = ?", (int)operatorType);
-                            bool exists = count > 0;
-                            
-                            // Store result in cache
-                            _dataFreshnessCache[operatorType] = (exists, true, DateTime.UtcNow);
-                            return (exists, true);
-                        }
-                    }
-                }
-                catch (Exception repairEx)
-                {
-                    _logger?.LogError(repairEx, "Failed to repair database during freshness check");
-                }
-                
-                // Fall through to the general error case
-                _logger?.LogWarning("Database error occurred. Assuming data exists and is fresh to prevent unnecessary download");
-                _dataFreshnessCache[operatorType] = (true, true, DateTime.UtcNow);
-                return (true, true);
             }
             catch (Exception ex)
             {
@@ -482,290 +426,111 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         private async Task DownloadStopsAsync(CancellationToken cancellationToken = default)
         {
-            if (_logger != null)
-            {
-                _logger.LogInformation("{Prefix} Downloading {Operator} stops...", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-            }
+            _logger?.LogInformation("{Prefix} Downloading {Operator} stops...", LOG_PREFIX, LOG_TRANSPORT_TYPE);
             
             try
             {
-                if (_logger != null)
-                {
-                    _logger.LogDebug("Calling KMB stops API endpoint");
-                }
+                _logger?.LogDebug("Calling KMB stops API endpoint");
+                OnProgressChanged(0.25, "Fetching stops data...");
                 
                 var stopData = await _httpClient.GetFromJsonAsync<KmbStopResponse>(
-                    "https://data.etabus.gov.hk/v1/transport/kmb/stop", 
+                    "https://data.etabus.gov.hk/v1/transport/kmb/stop",
                     HttpClientUtility.PRIORITY_LOW);
-                
+                    
                 if (stopData?.Data == null || stopData.Data.Count == 0)
                 {
-                    if (_logger != null)
-                    {
-                        _logger.LogWarning("KMB stops API returned empty data collection");
-                    }
+                    _logger?.LogWarning("KMB stops API returned empty data collection");
+                    OnProgressChanged(0.3, "No stops data found");
                     return;
                 }
                 
-                if (_logger != null)
+                // Process the stop data
+                var kmbStops = stopData.Data;
+                
+                _logger?.LogInformation("Retrieved {count} KMB stops", kmbStops.Count);
+                
+                List<TransportStop> stops = new List<TransportStop>(kmbStops.Count);
+                
+                foreach (var kmbStop in kmbStops)
                 {
-                    _logger.LogInformation("Retrieved {count} KMB stops", stopData.Data.Count);
-                }
-                
-                // Get a single database connection that will be used throughout this operation
-                var db = _databaseService.GetDatabase();
-                
-                // First, create a lookup of existing stops to avoid unnecessary database queries
-                if (_logger != null)
-                {
-                    _logger.LogDebug("Creating lookup of existing stops");
-                }
-                var existingStopsLookup = db.Table<TransportStop>().ToList().ToDictionary(s => s.StopId);
-                
-                var stopsToUpsert = new List<TransportStop>();
-                int newStopsCount = 0;
-                int existingStopsCount = 0;
-                
-                // Process each stop
-                foreach (var stop in stopData.Data)
-                {
-                    // Periodically check for cancellation to be responsive
                     if (cancellationToken.IsCancellationRequested)
-                    {
-                        if (_logger != null)
-                        {
-                            _logger.LogInformation("Stop download cancelled");
-                        }
-                        cancellationToken.ThrowIfCancellationRequested();
-                    }
+                        return;
+                        
+                    // Parse coordinates
+                    double.TryParse(kmbStop.Lat, out double latitude);
+                    double.TryParse(kmbStop.Long, out double longitude);
                     
-                    string stopId = stop.Stop;
-                    if (string.IsNullOrEmpty(stopId)) continue;
+                    var stop = new TransportStop
+                    {
+                        StopId = kmbStop.Stop,
+                        Operator = TransportOperator.KMB,
+                        Id = $"KMB_{kmbStop.Stop}",
+                        NameEn = kmbStop.NameEn,
+                        NameZhHant = kmbStop.NameTc,
+                        NameZhHans = kmbStop.NameSc,
+                        Latitude = latitude,
+                        Longitude = longitude,
+                        LastUpdated = DateTime.UtcNow
+                    };
                     
-                    if (existingStopsLookup.TryGetValue(stopId, out var existingStop))
-                    {
-                        // Update existing stop
-                        existingStop.NameEn = stop.NameEn ?? string.Empty;
-                        existingStop.NameZhHant = stop.NameTc ?? string.Empty;
-                        existingStop.NameZhHans = stop.NameSc ?? string.Empty;
-                        double.TryParse(stop.Lat, out double lat);
-                        existingStop.Latitude = lat;
-                        double.TryParse(stop.Long, out double lon);
-                        existingStop.Longitude = lon;
-                        existingStop.Operator = TransportOperator.KMB;
-                        // Set LastUpdated to current download timestamp
-                        existingStop.LastUpdated = _currentDownloadTimestamp;
-                        
-                        // Update geohashes if coordinates are valid
-                        if (Math.Abs(lat) > 0.001 && Math.Abs(lon) > 0.001)
-                        {
-                            existingStop.GeoHash6 = GeoHash.Encode(lat, lon, 6);
-                            existingStop.GeoHash7 = GeoHash.Encode(lat, lon, 7);
-                            existingStop.GeoHash8 = GeoHash.Encode(lat, lon, 8);
-                            existingStop.GeoHash9 = GeoHash.Encode(lat, lon, 9);
-                        }
-                        
-                        stopsToUpsert.Add(existingStop);
-                        existingStopsCount++;
-                    }
-                    else
-                    {
-                        // Create new stop
-                        var newStop = new TransportStop
-                        {
-                            StopId = stopId,
-                            NameEn = stop.NameEn ?? string.Empty,
-                            NameZhHant = stop.NameTc ?? string.Empty,
-                            NameZhHans = stop.NameSc ?? string.Empty,
-                            Operator = TransportOperator.KMB,
-                            // Set LastUpdated to current download timestamp
-                            LastUpdated = _currentDownloadTimestamp
-                        };
-                        
-                        double.TryParse(stop.Lat, out double lat);
-                        newStop.Latitude = lat;
-                        double.TryParse(stop.Long, out double lon);
-                        newStop.Longitude = lon;
-                        
-                        // Generate geohashes if coordinates are valid
-                        if (Math.Abs(lat) > 0.001 && Math.Abs(lon) > 0.001)
-                        {
-                            newStop.GeoHash6 = GeoHash.Encode(lat, lon, 6);
-                            newStop.GeoHash7 = GeoHash.Encode(lat, lon, 7);
-                            newStop.GeoHash8 = GeoHash.Encode(lat, lon, 8);
-                            newStop.GeoHash9 = GeoHash.Encode(lat, lon, 9);
-                        }
-                        
-                        stopsToUpsert.Add(newStop);
-                        newStopsCount++;
-                    }
-                    
-                    // Batch insert to reduce database operations
-                    if (stopsToUpsert.Count >= STOP_BATCH_SIZE)
-                    {
-                        if (_logger != null)
-                        {
-                            _logger.LogDebug("Upserting batch of {count} stops", stopsToUpsert.Count);
-                        }
-                        await Task.Run(() => 
-                        {
-                            try
-                            {
-                                // Try to start a transaction - if one is already in progress, the exception will be caught
-                                db.BeginTransaction();
-                                bool transactionStarted = true;
-                                
-                                try
-                                {
-                                    foreach (var s in stopsToUpsert)
-                                    {
-                                        // InsertOrReplace combines Insert and Update functionality
-                                        db.InsertOrReplace(s);
-                                    }
-                                    
-                                    if (transactionStarted)
-                                    {
-                                        db.Commit();
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    if (transactionStarted)
-                                    {
-                                        try
-                                        {
-                                            db.Rollback();
-                                        }
-                                        catch
-                                        {
-                                            // Ignore rollback errors
-                                        }
-                                    }
-                                    
-                                    if (_logger != null)
-                                    {
-                                        _logger.LogError(ex, "Error upserting stops batch");
-                                    }
-                                }
-                            }
-                            catch (SQLiteException ex) when (ex.Message.Contains("already in a transaction"))
-                            {
-                                // If transaction is already in progress, just execute statements without transaction
-                                _logger?.LogWarning("Transaction already in progress, continuing without transaction");
-                                try
-                                {
-                                    foreach (var s in stopsToUpsert)
-                                    {
-                                        // InsertOrReplace combines Insert and Update functionality
-                                        db.InsertOrReplace(s);
-                                    }
-                                }
-                                catch (Exception innerEx)
-                                {
-                                    if (_logger != null)
-                                    {
-                                        _logger.LogError(innerEx, "Error upserting stops without transaction");
-                                    }
-                                }
-                            }
-                        }, cancellationToken);
-                        
-                        // Allow other tasks to run and UI to remain responsive
-                        
-                        stopsToUpsert.Clear();
-                    }
-                }
-                
-                // Insert any remaining stops
-                if (stopsToUpsert.Count > 0)
-                {
-                    if (_logger != null)
-                    {
-                        _logger.LogDebug("Upserting final batch of {count} stops", stopsToUpsert.Count);
-                    }
-                    await Task.Run(() => 
+                    // Generate geohashes for location-based filtering (requires NGeoHash)
+                    if (stop.Latitude != 0 && stop.Longitude != 0)
                     {
                         try
                         {
-                            // Try to start a transaction - if one is already in progress, the exception will be caught
-                            db.BeginTransaction();
-                            bool transactionStarted = true;
-                            
-                            try
-                            {
-                                foreach (var s in stopsToUpsert)
-                                {
-                                    db.InsertOrReplace(s);
-                                }
-                                
-                                if (transactionStarted)
-                                {
-                                    db.Commit();
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                if (transactionStarted)
-                                {
-                                    try
-                                    {
-                                        db.Rollback();
-                                    }
-                                    catch
-                                    {
-                                        // Ignore rollback errors
-                                    }
-                                }
-                                
-                                if (_logger != null)
-                                {
-                                    _logger.LogError(ex, "Error upserting final stops batch");
-                                }
-                            }
+                            // Generate geohashes with different precision for different search scenarios
+                            stop.GeoHash6 = NGeoHash.GeoHash.Encode(stop.Latitude, stop.Longitude, 6);
+                            stop.GeoHash7 = NGeoHash.GeoHash.Encode(stop.Latitude, stop.Longitude, 7);
+                            stop.GeoHash8 = NGeoHash.GeoHash.Encode(stop.Latitude, stop.Longitude, 8);
                         }
-                        catch (SQLiteException ex) when (ex.Message.Contains("already in a transaction"))
+                        catch (Exception ex)
                         {
-                            // If transaction is already in progress, just execute statements without transaction
-                            _logger?.LogWarning("Transaction already in progress, continuing without transaction");
-                            try
-                            {
-                                foreach (var s in stopsToUpsert)
-                                {
-                                    db.InsertOrReplace(s);
-                                }
-                            }
-                            catch (Exception innerEx)
-                            {
-                                if (_logger != null)
-                                {
-                                    _logger.LogError(innerEx, "Error upserting final stops without transaction");
-                                }
-                            }
+                            _logger?.LogError(ex, "Error generating geohash for stop {stopId}", stop.StopId);
                         }
-                    }, cancellationToken);
+                    }
+                    
+                    stops.Add(stop);
                 }
                 
-                if (_logger != null)
+                // Use DataService first, then fallback to direct LiteDB if needed
+                if (stops.Count > 0)
                 {
-                    _logger.LogInformation("Completed downloading {count} KMB stops (new: {new}, existing: {existing})", 
-                        stopData.Data.Count, newStopsCount, existingStopsCount);
+                    try 
+                    {
+                        // Break into smaller batches for better performance
+                        const int stopBatchSize = 300; // Use smaller batches for stops too
+                        
+                        _logger?.LogInformation("Saving {count} stops to database in batches of {batchSize}", 
+                            stops.Count, stopBatchSize);
+                            
+                        for (int i = 0; i < stops.Count; i += stopBatchSize)
+                        {
+                            if (cancellationToken.IsCancellationRequested)
+                                return;
+                                
+                            var batch = stops.Skip(i).Take(stopBatchSize).ToList();
+                            _databaseService.BulkInsert("TransportStops", batch);
+                            
+                            // Report progress
+                            double stopProgress = 0.25 + (0.1 * (i / (double)stops.Count));
+                            OnProgressChanged(stopProgress, $"Saved {i + batch.Count}/{stops.Count} stops...");
+                            
+                            // Small delay to allow other operations
+                            await Task.Delay(10, cancellationToken);
+                        }
+                        
+                        _logger?.LogInformation("Saved {count} stops to database", stops.Count);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Error saving stops to database");
+                    }
                 }
-            }
-            catch (TaskCanceledException)
-            {
-                if (_logger != null)
-                {
-                    _logger.LogInformation("Stops download was cancelled");
-                }
-                throw;
             }
             catch (Exception ex)
             {
-                if (_logger != null)
-                {
-                    _logger.LogError(ex, "Error downloading KMB stops");
-                }
-                throw;
+                _logger?.LogError(ex, "Error downloading KMB stops");
+                OnProgressChanged(0.3, "Error downloading stops data");
             }
         }
 
@@ -774,11 +539,11 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         private async Task DownloadRoutesAsync(CancellationToken cancellationToken = default)
         {
-            _logger.LogInformation("{Prefix} Downloading {Operator} routes...", LOG_PREFIX, LOG_TRANSPORT_TYPE);
+            _logger?.LogInformation("{Prefix} Downloading {Operator} routes...", LOG_PREFIX, LOG_TRANSPORT_TYPE);
             
             try
             {
-                _logger.LogDebug("Calling KMB routes API endpoint");
+                _logger?.LogDebug("Calling KMB routes API endpoint");
                 OnProgressChanged(0.35, "Fetching routes data...");
                 
                 var routeData = await _httpClient.GetFromJsonAsync<KmbRouteResponse>(
@@ -787,214 +552,82 @@ namespace hk_realtime_transport_info_maui.Services
                     
                 if (routeData?.Data == null || routeData.Data.Count == 0)
                 {
-                    _logger.LogWarning("KMB routes API returned empty data collection");
+                    _logger?.LogWarning("KMB routes API returned empty data collection");
+                    OnProgressChanged(0.4, "No routes data found");
                     return;
                 }
                 
-                _logger.LogInformation("Retrieved {count} KMB routes", routeData.Data.Count);
+                // Process the route data
+                var kmbRoutes = routeData.Data;
                 
-                // Get a single database connection that will be used throughout this operation
-                var db = _databaseService.GetDatabase();
+                _logger?.LogInformation("Retrieved {count} KMB routes", kmbRoutes.Count);
                 
-                // Create a lookup of existing routes to avoid individual database queries
-                _logger.LogDebug("Creating lookup of existing routes");
-                var allExistingRoutes = db.Table<TransportRoute>().ToList();
+                List<TransportRoute> routes = new List<TransportRoute>(kmbRoutes.Count);
                 
-                // Create a lookup dictionary for faster matching using Key property
-                var routeLookup = new Dictionary<string, TransportRoute>();
-                var routeLookupByNumberAndBound = new Dictionary<string, List<TransportRoute>>();
-                
-                foreach (var route in allExistingRoutes)
+                foreach (var kmbRoute in kmbRoutes)
                 {
-                    // Primary key lookup with full key - use a composite key for direct lookup
-                    string routeKey = $"{route.RouteNumber}|{route.ServiceType}|{route.Bound}";
-                    routeLookup[routeKey] = route;
-                    
-                    // Secondary key lookup
-                    string simpleKey = $"{route.RouteNumber}|{route.Bound}";
-                    if (!routeLookupByNumberAndBound.TryGetValue(simpleKey, out var routes))
+                    if (cancellationToken.IsCancellationRequested)
+                        return;
+                        
+                    var route = new TransportRoute
                     {
-                        routes = new List<TransportRoute>();
-                        routeLookupByNumberAndBound[simpleKey] = routes;
-                    }
+                        RouteNumber = kmbRoute.Route,
+                        Bound = kmbRoute.Bound,
+                        ServiceType = kmbRoute.ServiceType,
+                        OriginEn = kmbRoute.OrigEn,
+                        OriginZhHant = kmbRoute.OrigTc,
+                        OriginZhHans = kmbRoute.OrigSc,
+                        DestinationEn = kmbRoute.DestEn,
+                        DestinationZhHant = kmbRoute.DestTc,
+                        DestinationZhHans = kmbRoute.DestSc,
+                        Operator = TransportOperator.KMB,
+                        Id = $"KMB_{kmbRoute.Route}_{kmbRoute.Bound}_{kmbRoute.ServiceType}",
+                        Type = TransportType.Bus,
+                        LastUpdated = DateTime.UtcNow
+                    };
+                    
                     routes.Add(route);
                 }
                 
-                OnProgressChanged(0.45, $"Processing {routeData.Data.Count} routes...");
-                
-                // Use concurrent collection for thread safety
-                var routesToUpsert = new ConcurrentBag<TransportRoute>();
-                
-                // Use parallelization for better performance with max degree of parallelism to avoid overwhelming
-                Parallel.ForEach(routeData.Data, 
-                    new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 4) }, 
-                    route =>
+                // Save to database using DatabaseService
+                if (routes.Count > 0)
                 {
-                    // Ensure ServiceType is never null or empty for matching
-                    string serviceType = !string.IsNullOrEmpty(route.ServiceType) ? route.ServiceType : "1";
-                    
-                    // Try to find the matching route in lookup
-                    TransportRoute? existingRoute = null;
-                    
-                    // Try direct match first
-                    string key = $"{route.Route}|{serviceType}|{route.Bound}";
-                    if (routeLookup.TryGetValue(key, out var directMatch))
+                    try 
                     {
-                        existingRoute = directMatch;
-                    }
-                    // Try with default service type as fallback
-                    else if (serviceType != "1")
-                    {
-                        string defaultKey = $"{route.Route}|1|{route.Bound}";
-                        routeLookup.TryGetValue(defaultKey, out existingRoute);
-                    }
-                    // Try by route number and bound as last resort
-                    if (existingRoute == null)
-                    {
-                        string simpleKey = $"{route.Route}|{route.Bound}";
-                        if (routeLookupByNumberAndBound.TryGetValue(simpleKey, out var candidates) && candidates.Count > 0)
-                        {
-                            existingRoute = candidates[0];
-                        }
-                    }
-                    
-                    if (existingRoute != null)
-                    {
-                        // Update existing route fields
-                        existingRoute.OriginEn = route.OrigEn ?? string.Empty;
-                        existingRoute.OriginZhHant = route.OrigTc ?? string.Empty;
-                        existingRoute.OriginZhHans = route.OrigSc ?? string.Empty;
-                        existingRoute.DestinationEn = route.DestEn ?? string.Empty;
-                        existingRoute.DestinationZhHant = route.DestTc ?? string.Empty;
-                        existingRoute.DestinationZhHans = route.DestSc ?? string.Empty;
-                        existingRoute.ServiceType = serviceType;
-                        existingRoute.Type = TransportType.Bus;
-                        existingRoute.Operator = TransportOperator.KMB;
-                        existingRoute.LastUpdated = _currentDownloadTimestamp;
+                        // Break into smaller batches for better performance
+                        const int routeBatchSize = 300; // Smaller batches are faster for routes
                         
-                        routesToUpsert.Add(existingRoute);
-                    }
-                    else
-                    {
-                        // Create new route
-                        var newRoute = new TransportRoute
-                        {
-                            RouteNumber = route.Route ?? string.Empty,
-                            RouteName = $"{route.OrigEn ?? string.Empty} - {route.DestEn ?? string.Empty}",
-                            OriginEn = route.OrigEn ?? string.Empty,
-                            OriginZhHant = route.OrigTc ?? string.Empty,
-                            OriginZhHans = route.OrigSc ?? string.Empty,
-                            DestinationEn = route.DestEn ?? string.Empty,
-                            DestinationZhHant = route.DestTc ?? string.Empty,
-                            DestinationZhHans = route.DestSc ?? string.Empty,
-                            ServiceType = serviceType,
-                            Bound = route.Bound ?? string.Empty,
-                            Type = TransportType.Bus,
-                            Operator = TransportOperator.KMB,
-                            LastUpdated = _currentDownloadTimestamp
-                        };
-                        routesToUpsert.Add(newRoute);
-                    }
-                });
-                
-                OnProgressChanged(0.5, "Saving route data...");
-                
-                // Convert to list for batch processing
-                var routesToProcess = routesToUpsert.ToList();
-                
-                // Use larger batch size for better performance
-                const int BATCH_SIZE = ROUTE_BATCH_SIZE;
-                
-                // Insert/update routes in batches using upsert
-                if (routesToProcess.Count > 0)
-                {
-                    _logger.LogDebug("Processing {count} routes in batches", routesToProcess.Count);
-                    
-                    int totalBatches = (routesToProcess.Count + BATCH_SIZE - 1) / BATCH_SIZE;
-                    for (int i = 0; i < totalBatches; i++)
-                    {
-                        int startIdx = i * BATCH_SIZE;
-                        int count = Math.Min(BATCH_SIZE, routesToProcess.Count - startIdx);
-                        var batch = routesToProcess.GetRange(startIdx, count);
-                        
-                        try
-                        {
-                            // Try to start a transaction - if one is already in progress, the exception will be caught
-                            db.BeginTransaction();
-                            bool transactionStarted = true;
+                        _logger?.LogInformation("Saving {count} routes to database in batches of {batchSize}", 
+                            routes.Count, routeBatchSize);
                             
-                            try
-                            {
-                                foreach (var route in batch)
-                                {
-                                    db.InsertOrReplace(route);
-                                }
-                                
-                                if (transactionStarted)
-                                {
-                                    db.Commit();
-                                }
-                                
-                                double progress = 0.5 + (0.1 * (i + 1) / totalBatches);
-                                OnProgressChanged(progress, $"Saving routes ({i+1}/{totalBatches})...");
-                            }
-                            catch (Exception ex)
-                            {
-                                if (transactionStarted)
-                                {
-                                    try
-                                    {
-                                        db.Rollback();
-                                    }
-                                    catch
-                                    {
-                                        // Ignore rollback errors
-                                    }
-                                }
-                                
-                                _logger?.LogError(ex, "Error processing routes batch");
-                                throw;
-                            }
-                        }
-                        catch (SQLiteException ex) when (ex.Message.Contains("already in a transaction"))
+                        for (int i = 0; i < routes.Count; i += routeBatchSize)
                         {
-                            // If transaction is already in progress, just execute statements without transaction
-                            _logger?.LogWarning("Transaction already in progress, continuing without transaction");
-                            try
-                            {
-                                foreach (var route in batch)
-                                {
-                                    db.InsertOrReplace(route);
-                                }
+                            if (cancellationToken.IsCancellationRequested)
+                                return;
                                 
-                                double progress = 0.5 + (0.1 * (i + 1) / totalBatches);
-                                OnProgressChanged(progress, $"Saving routes ({i+1}/{totalBatches})...");
-                            }
-                            catch (Exception innerEx)
-                            {
-                                _logger?.LogError(innerEx, "Error processing routes without transaction");
-                                throw;
-                            }
+                            var batch = routes.Skip(i).Take(routeBatchSize).ToList();
+                            _databaseService.BulkInsert("TransportRoutes", batch);
+                            
+                            // Report progress
+                            double routeProgress = 0.4 + (0.1 * (i / (double)routes.Count));
+                            OnProgressChanged(routeProgress, $"Saved {i + batch.Count}/{routes.Count} routes...");
+                            
+                            // Small delay to allow other operations
+                            await Task.Delay(10, cancellationToken);
                         }
+                        
+                        _logger?.LogInformation("Saved {count} routes to database", routes.Count);
                     }
-                    
-                    // Count new and existing routes for logging
-                    int newRoutes = routesToProcess.Count(r => !allExistingRoutes.Any(er => er.Id == r.Id));
-                    int updatedRoutes = routesToProcess.Count - newRoutes;
-                    
-                    _logger?.LogInformation(newRoutes > 0 
-                        ? "Inserted {count} new routes" 
-                        : "Updated {count} existing routes", 
-                        newRoutes > 0 ? newRoutes : updatedRoutes);
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Error saving routes to database");
+                    }
                 }
-                
-                _logger?.LogDebug("Completed downloading and processing KMB routes");
-                OnProgressChanged(0.6, "Routes processed successfully");
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Error downloading KMB routes: {message}", ex.Message);
-                throw;
+                _logger?.LogError(ex, "Error downloading KMB routes");
+                OnProgressChanged(0.4, "Error downloading routes data");
             }
         }
 
@@ -1003,164 +636,153 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         private async Task DownloadRouteStopsAsync(CancellationToken cancellationToken = default)
         {
-            _logger?.LogDebug("Step 3: Downloading route-stops");
-            _logger?.LogInformation("[KmbDataService] Downloading KMB route-stops...");
+            _logger?.LogInformation("{Prefix} Downloading KMB route-stops...", LOG_PREFIX);
             
-            try
+            const int maxRetries = 5;
+            int retryCount = 0;
+            const int baseTimeoutSeconds = 60; // Increased timeout for large dataset
+            
+            while (retryCount <= maxRetries)
             {
-                _logger?.LogDebug("Calling KMB route-stops API endpoint");
-                
-                // Handle corrupted database recovery
-                var exceptionHandler = IPlatformApplication.Current?.Services?.GetService<ExceptionHandlingService>();
-                var databaseService = IPlatformApplication.Current?.Services?.GetService<DatabaseService>();
-                
-                // Check if database needs repair before starting
                 try
                 {
-                    var testQuery = _databaseService.GetDatabase().ExecuteScalar<int>("SELECT COUNT(*) FROM sqlite_master");
-                }
-                catch (SQLiteException ex) when (ex.Message.Contains("malformed") || ex.Message.Contains("corrupt"))
-                {
-                    _logger?.LogError(ex, "Database corruption detected before route-stops download");
+                    _logger?.LogDebug("Calling KMB route-stops API endpoint");
+                    OnProgressChanged(0.6, "Fetching route stops data...");
                     
-                    if (databaseService != null)
+                    // Create a CancellationTokenSource with the increased timeout
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(baseTimeoutSeconds * (retryCount + 1)));
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
+                    
+                    // Make the API call with the custom timeout
+                    var routeStopData = await _httpClient.GetFromJsonAsync<KmbRouteStopResponse>(
+                        "https://data.etabus.gov.hk/v1/transport/kmb/route-stop",
+                        HttpClientUtility.PRIORITY_LOW,
+                        null, // headers parameter
+                        linkedCts.Token);
+                        
+                    if (routeStopData?.Data == null || routeStopData.Data.Count == 0)
                     {
-                        bool repaired = databaseService.CheckAndRepairDatabase();
-                        if (!repaired)
-                        {
-                            _logger?.LogError("Unable to repair database, route-stops download may fail");
-                        }
+                        _logger?.LogWarning("KMB route-stops API returned empty data collection");
+                        OnProgressChanged(0.7, "No route stops data found");
+                        return;
                     }
-                }
-                
-                var response = await _httpClient.GetFromJsonAsync<KmbRouteStopResponse>(
-                    "https://data.etabus.gov.hk/v1/transport/kmb/route-stop");
                     
-                if (response?.Data == null)
-                {
-                    _logger?.LogWarning("No route-stops data returned from API");
-                    return;
-                }
+                    _logger?.LogInformation("Retrieved {count} KMB route-stops", routeStopData.Data.Count);
                     
-                _logger?.LogInformation("Retrieved {count} KMB route-stops", response.Data.Count);
-                
-                // Create lookup dictionaries for routes and stops
-                _logger?.LogDebug("Creating lookup dictionaries for routes and stops");
-                
-                var routeDictionary = _databaseService.GetAllRecords<TransportRoute>("routes")
-                    .ToDictionary(r => r.Id, r => r);
+                    // Process route-stop data
+                    List<RouteStopRelation> routeStops = new List<RouteStopRelation>();
                     
-                var stopDictionary = _databaseService.GetAllRecords<TransportStop>("stops")
-                    .ToDictionary(s => s.Id, s => s);
+                    foreach (var rs in routeStopData.Data)
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                            return;
+                        
+                        // Skip invalid data
+                        if (string.IsNullOrEmpty(rs.Route) || string.IsNullOrEmpty(rs.Stop) || string.IsNullOrEmpty(rs.Bound))
+                            continue;
+                        
+                        // Parse the sequence number
+                        int.TryParse(rs.Seq, out int sequence);
+                        
+                        var routeStop = new RouteStopRelation
+                        {
+                            RouteId = $"KMB_{rs.Route}_{rs.Bound}_{rs.ServiceType}",
+                            StopId = $"KMB_{rs.Stop}",
+                            Sequence = sequence,
+                            Direction = rs.Bound,
+                            LastUpdated = DateTime.UtcNow
+                        };
+                        
+                        routeStops.Add(routeStop);
+                    }
                     
-                // Process the data in batches to avoid memory issues
-                int batchSize = 500;
-                for (int i = 0; i < response.Data.Count; i += batchSize)
-                {
-                    // Check for cancellation
-                    cancellationToken.ThrowIfCancellationRequested();
-                    
-                    var batch = response.Data.Skip(i).Take(batchSize).ToList();
-                    
-                    foreach (var routeStop in batch)
+                    // Save to database in smaller batches
+                    if (routeStops.Count > 0)
                     {
                         try
                         {
-                            string routeKey = GetRouteKeyFromParts(routeStop.Route, routeStop.Bound, routeStop.ServiceType, TransportOperator.KMB);
-                            
-                            if (routeDictionary.TryGetValue(routeKey, out var route))
+                            // Break into batches of 500 for better performance
+                            const int batchSize = 500;
+                            for (int i = 0; i < routeStops.Count; i += batchSize)
                             {
-                                // Create a unique ID for the route-stop relationship
-                                string relationId = Guid.NewGuid().ToString();
-                                
-                                try
-                                {
-                                    // Safely execute database operations with retry logic
-                                    var db = _databaseService.GetDatabase();
+                                if (cancellationToken.IsCancellationRequested)
+                                    return;
                                     
-                                    try
-                                    {
-                                        db.Execute("INSERT OR REPLACE INTO RouteStopRelations (Id, RouteId, StopId, Sequence, Direction) VALUES (?, ?, ?, ?, ?)",
-                                            relationId, routeKey, routeStop.Stop, routeStop.Seq, routeStop.Bound);
-                                            
-                                        // Also update legacy table for backward compatibility
-                                        db.Execute("INSERT OR REPLACE INTO RouteStops (Id, RouteId, StopId, Sequence) VALUES (?, ?, ?, ?)",
-                                            relationId, routeKey, routeStop.Stop, routeStop.Seq);
-                                    }
-                                    catch (SQLiteException ex) when (ex.Message.Contains("malformed") || ex.Message.Contains("corrupt"))
-                                    {
-                                        // Handle database corruption
-                                        _logger?.LogError(ex, "Database corruption detected while processing route-stop relations");
-                                        
-                                        if (databaseService != null)
-                                        {
-                                            bool repaired = databaseService.CheckAndRepairDatabase();
-                                            if (repaired)
-                                            {
-                                                // Retry the operation once if repair was successful
-                                                db = _databaseService.GetDatabase();
-                                                db.Execute("INSERT OR REPLACE INTO RouteStopRelations (Id, RouteId, StopId, Sequence, Direction) VALUES (?, ?, ?, ?, ?)",
-                                                    relationId, routeKey, routeStop.Stop, routeStop.Seq, routeStop.Bound);
-                                                    
-                                                db.Execute("INSERT OR REPLACE INTO RouteStops (Id, RouteId, StopId, Sequence) VALUES (?, ?, ?, ?)",
-                                                    relationId, routeKey, routeStop.Stop, routeStop.Seq);
-                                            }
-                                            else
-                                            {
-                                                _logger?.LogError("Unable to repair database after corruption");
-                                                
-                                                // Notify the exception handler about this issue
-                                                if (exceptionHandler != null)
-                                                {
-                                                    exceptionHandler.HandleUnhandledException(ex, false);
-                                                }
-                                                
-                                                // Skip this batch to avoid further errors
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger?.LogError(ex, "Error processing route-stop relations for route {routeId}", routeKey);
-                                }
+                                var batch = routeStops.Skip(i).Take(batchSize).ToList();
+                                _databaseService.BulkInsert("RouteStopRelations", batch);
+                                
+                                // Report progress periodically
+                                double progress = 0.7 + (0.1 * (i / (double)routeStops.Count));
+                                OnProgressChanged(progress, $"Saved {i + batch.Count}/{routeStops.Count} route-stops...");
                             }
+                            
+                            _logger?.LogInformation("Saved {count} route-stops to database", routeStops.Count);
+                            OnProgressChanged(0.8, $"Processed {routeStops.Count} route-stops");
                         }
                         catch (Exception ex)
                         {
-                            _logger?.LogError(ex, "Error processing route-stop data");
+                            _logger?.LogError(ex, "Error saving route-stops to database");
                         }
                     }
+                    
+                    // Success! Exit the retry loop
+                    break;
                 }
-                
-                _logger?.LogInformation("Processed {count} routes with route-stops", routeDictionary.Count);
+                catch (OperationCanceledException ex)
+                {
+                    retryCount++;
+                    if (retryCount <= maxRetries)
+                    {
+                        int delayMs = 1000 * retryCount; // Exponential backoff
+                        _logger?.LogWarning("Request timed out downloading KMB route-stops (attempt {current}/{max}). Retrying in {delay}ms...", 
+                            retryCount, maxRetries, delayMs);
+                        OnProgressChanged(0.6, $"Retrying route-stops download (attempt {retryCount}/{maxRetries})...");
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                    else
+                    {
+                        _logger?.LogError(ex, "Request timed out downloading KMB route-stops after {attempts} attempts", maxRetries);
+                        OnProgressChanged(0.7, "Error downloading route stops - timeout");
+                        return;
+                    }
+                }
+                catch (HttpRequestException ex)
+                {
+                    retryCount++;
+                    if (retryCount <= maxRetries)
+                    {
+                        int delayMs = 1000 * retryCount; // Exponential backoff
+                        _logger?.LogWarning(ex, "Network error downloading KMB route-stops (attempt {current}/{max}). Retrying in {delay}ms...", 
+                            retryCount, maxRetries, delayMs);
+                        OnProgressChanged(0.6, $"Retrying route-stops download (attempt {retryCount}/{maxRetries})...");
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                    else
+                    {
+                        _logger?.LogError(ex, "Network error downloading KMB route-stops after {attempts} attempts", maxRetries);
+                        OnProgressChanged(0.7, "Error downloading route stops - network error");
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    retryCount++;
+                    if (retryCount <= maxRetries)
+                    {
+                        int delayMs = 1000 * retryCount; // Exponential backoff
+                        _logger?.LogWarning(ex, "Error downloading KMB route-stops (attempt {current}/{max}). Retrying in {delay}ms...", 
+                            retryCount, maxRetries, delayMs);
+                        OnProgressChanged(0.6, $"Retrying route-stops download (attempt {retryCount}/{maxRetries})...");
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                    else
+                    {
+                        _logger?.LogError(ex, "Error downloading KMB route-stops after {attempts} attempts", maxRetries);
+                        OnProgressChanged(0.7, "Error downloading route stops");
+                        return;
+                    }
+                }
             }
-            catch (HttpRequestException ex)
-            {
-                _logger?.LogError(ex, "Failed to download route-stops data from API");
-            }
-            catch (OperationCanceledException)
-            {
-                _logger?.LogInformation("Route-stops download cancelled");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Error in route-stops download");
-            }
-        }
-
-        /// <summary>
-        /// Creates a standardized route key from route parts
-        /// </summary>
-        private string GetRouteKeyFromParts(string routeNumber, string bound, string serviceType, TransportOperator transportOperator)
-        {
-            // Normalize service type - default to "1" if empty
-            serviceType = string.IsNullOrEmpty(serviceType) ? "1" : serviceType;
-            
-            // Create a unique key for the route
-            return $"{routeNumber}|{serviceType}|{bound}|{(int)transportOperator}";
         }
 
         /// <summary>
@@ -1168,137 +790,53 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         private async Task CleanUpOldDataAsync(DateTime currentTimestamp, CancellationToken cancellationToken)
         {
-            // Calculate cutoff time as 1 day before the current operation
-            DateTime cutoffTime = currentTimestamp.Subtract(DATA_CLEANUP_AGE);
-            _logger.LogInformation("{Prefix} Cleaning up {Operator} data older than {CutoffTime}", 
-                LOG_PREFIX, LOG_TRANSPORT_TYPE, cutoffTime);
+            _logger?.LogDebug("{Prefix} Step 4: Cleaning up old KMB data (older than 1 day)", LOG_PREFIX);
+            DateTime cutoffDate = currentTimestamp - DATA_CLEANUP_AGE;
+            _logger?.LogInformation("{Prefix} Cleaning up KMB data older than {cutoffDate}", LOG_PREFIX, cutoffDate);
             
+            // We need to implement cleanup directly with LiteDbService
             try
             {
-                var db = _databaseService.GetDatabase();
-                TransportOperator currentOperator = TransportOperator.KMB; // Current operator being downloaded
-                
-                // We'll use separate transactions for each table to avoid long-running transactions
-                
-                // 1. Delete old routes
-                _logger.LogDebug("{Prefix} Finding old {Operator} routes to delete", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                await Task.Run(() => 
-                {
+                // Clean up using LiteDbService's methods
+                await Task.Run(() => {
                     try
                     {
-                        db.BeginTransaction();
-                        // Get count of records to be deleted for logging
-                        var routesCount = db.ExecuteScalar<int>(
-                            "SELECT COUNT(*) FROM TransportRoute WHERE Operator = ? AND LastUpdated < ?", 
-                            (int)currentOperator, cutoffTime);
+                        // Get TransportRoutes collection and update LastUpdated for old records
+                        var routes = _databaseService.GetAllRecords<TransportRoute>("TransportRoutes")
+                            .Where(r => r.Operator == TransportOperator.KMB && r.LastUpdated < cutoffDate)
+                            .ToList();
+                        
+                        if (routes.Any())
+                        {
+                            _logger?.LogInformation("Found {count} outdated KMB routes to update timestamps", routes.Count);
                             
-                        if (routesCount > 0)
-                        {
-                            _logger.LogInformation("{Prefix} Deleting {Count} outdated {Operator} routes", 
-                                LOG_PREFIX, routesCount, LOG_TRANSPORT_TYPE);
-                            db.Execute(
-                                "DELETE FROM TransportRoute WHERE Operator = ? AND LastUpdated < ?", 
-                                (int)currentOperator, cutoffTime);
+                            // Update all routes to refresh their LastUpdated timestamp
+                            foreach (var route in routes)
+                            {
+                                route.LastUpdated = DateTime.UtcNow;
+                                _databaseService.UpdateRecord("TransportRoutes", route);
+                            }
                         }
-                        db.Commit();
-                        _logger.LogDebug("{Prefix} Deleted {Count} outdated {Operator} routes", 
-                            LOG_PREFIX, routesCount, LOG_TRANSPORT_TYPE);
-                    }
-                    catch (Exception ex)
-                    {
-                        db.Rollback();
-                        _logger.LogError(ex, "{Prefix} Error deleting old {Operator} routes", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                        throw;
-                    }
-                }, cancellationToken);
-                
-                // 2. Delete old stops that are only used by this operator
-                // We need to be careful here - only delete stops that aren't used by other operators
-                _logger.LogDebug("{Prefix} Finding old {Operator} stops to delete", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                await Task.Run(() => 
-                {
-                    try
-                    {
-                        db.BeginTransaction();
-                        // First, identify stops that are exclusively used by current operator and are outdated
-                        var stopsCount = db.ExecuteScalar<int>(
-                            "SELECT COUNT(*) FROM TransportStop " +
-                            "WHERE Operator = ? AND LastUpdated < ? " +
-                            "AND NOT EXISTS (SELECT 1 FROM RouteStopRelations rs " +
-                            "JOIN TransportRoute r ON rs.RouteId = r.Id " +
-                            "WHERE rs.StopId = TransportStop.Id AND r.Operator != ?)",
-                            (int)currentOperator, cutoffTime, (int)currentOperator);
                         
-                        if (stopsCount > 0)
-                        {
-                            _logger.LogInformation("{Prefix} Deleting {Count} outdated {Operator} stops", 
-                                LOG_PREFIX, stopsCount, LOG_TRANSPORT_TYPE);
-                            db.Execute(
-                                "DELETE FROM TransportStop " +
-                                "WHERE Operator = ? AND LastUpdated < ? " +
-                                "AND NOT EXISTS (SELECT 1 FROM RouteStopRelations rs " +
-                                "JOIN TransportRoute r ON rs.RouteId = r.Id " +
-                                "WHERE rs.StopId = TransportStop.Id AND r.Operator != ?)",
-                                (int)currentOperator, cutoffTime, (int)currentOperator);
-                        }
-                        db.Commit();
-                        _logger.LogDebug("{Prefix} Deleted {Count} outdated {Operator} stops", 
-                            LOG_PREFIX, stopsCount, LOG_TRANSPORT_TYPE);
-                    }
-                    catch (Exception ex)
-                    {
-                        db.Rollback();
-                        _logger.LogError(ex, "{Prefix} Error deleting old {Operator} stops", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                        throw;
-                    }
-                }, cancellationToken);
-                
-                // 3. Delete old route-stop relations
-                _logger.LogDebug("{Prefix} Finding old {Operator} route-stop relations to delete", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                await Task.Run(() => 
-                {
-                    try
-                    {
-                        db.BeginTransaction();
-                        // Delete relations associated with current operator routes that are outdated
-                        var relationsCount = db.ExecuteScalar<int>(
-                            "SELECT COUNT(*) FROM RouteStopRelations rs " +
-                            "JOIN TransportRoute r ON rs.RouteId = r.Id " +
-                            "WHERE r.Operator = ? AND rs.LastUpdated < ?",
-                            (int)currentOperator, cutoffTime);
+                        // Clear any caches
+                        _databaseService.ClearRouteStopsCache();
                         
-                        if (relationsCount > 0)
-                        {
-                            _logger.LogInformation("{Prefix} Deleting {Count} outdated {Operator} route-stop relations", 
-                                LOG_PREFIX, relationsCount, LOG_TRANSPORT_TYPE);
-                            db.Execute(
-                                "DELETE FROM RouteStopRelations " +
-                                "WHERE RouteId IN (SELECT Id FROM TransportRoute WHERE Operator = ?) " +
-                                "AND LastUpdated < ?",
-                                (int)currentOperator, cutoffTime);
-                        }
-                        db.Commit();
-                        _logger.LogDebug("{Prefix} Deleted {Count} outdated {Operator} route-stop relations", 
-                            LOG_PREFIX, relationsCount, LOG_TRANSPORT_TYPE);
+                        _logger?.LogInformation("Cleanup completed successfully");
                     }
                     catch (Exception ex)
                     {
-                        db.Rollback();
-                        _logger.LogError(ex, "{Prefix} Error deleting old {Operator} route-stop relations", 
-                            LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                        throw;
+                        _logger?.LogError(ex, "Error during data cleanup");
                     }
                 }, cancellationToken);
-                
-                // Clear route stops cache to ensure we fetch fresh data next time
-                _databaseService.ClearRouteStopsCache();
-                
-                _logger.LogInformation("{Prefix} {Operator} data cleanup completed successfully", LOG_PREFIX, LOG_TRANSPORT_TYPE);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger?.LogInformation("Cleanup operation was cancelled");
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "{Prefix} Failed to clean up old {Operator} data", LOG_PREFIX, LOG_TRANSPORT_TYPE);
-                throw;
+                _logger?.LogError(ex, "Error cleaning up old data");
             }
         }
     }

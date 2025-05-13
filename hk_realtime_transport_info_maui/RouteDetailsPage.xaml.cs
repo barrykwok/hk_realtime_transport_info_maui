@@ -12,7 +12,7 @@ namespace hk_realtime_transport_info_maui;
 
 public partial class RouteDetailsPage : ContentPage
 {
-    private readonly DatabaseService _databaseService;
+    private readonly LiteDbService _databaseService;
     private readonly EtaService _etaService;
     private readonly ILogger<RouteDetailsPage>? _logger;
     private bool _isRefreshing;
@@ -152,7 +152,7 @@ public partial class RouteDetailsPage : ContentPage
     
     public string LocalizedDestination => Route?.LocalizedDestination?.Replace("{0}", "").Trim() ?? string.Empty;
 
-    public RouteDetailsPage(DatabaseService databaseService, EtaService etaService, ILogger<RouteDetailsPage>? logger)
+    public RouteDetailsPage(LiteDbService databaseService, EtaService etaService, ILogger<RouteDetailsPage>? logger)
     {
         InitializeComponent();
         _databaseService = databaseService;
@@ -839,13 +839,15 @@ public partial class RouteDetailsPage : ContentPage
     {
         try
         {
-            if (Route == null)
+            _isLoadingStops = true;
+            
+            if (Route == null || string.IsNullOrEmpty(Route.Id))
             {
-                _logger?.LogWarning("Cannot load stops for null route");
+                _logger?.LogWarning("No route set for stop loading");
                 return;
             }
             
-            // Try to get stops from cache - this should be almost instant
+            // Get stops for this route from the database
             var stops = _databaseService.GetSortedStopsForRoute(Route.Id);
             
             if (stops.Count > 0)
@@ -872,6 +874,10 @@ public partial class RouteDetailsPage : ContentPage
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Error loading stops immediately");
+        }
+        finally
+        {
+            _isLoadingStops = false;
         }
     }
     
@@ -901,79 +907,34 @@ public partial class RouteDetailsPage : ContentPage
     
     private async Task LoadStopsInBackground()
     {
-        if (_isLoadingStops)
-        {
-            _logger?.LogDebug("Stops already loading, ignoring duplicate request");
-            return;
-        }
-        
         try
         {
             _isLoadingStops = true;
-            IsRefreshing = true;
             
-            // Load stops in background to ensure we have the latest data
-            await Task.Run(() => 
-            {
-                try
-                {
-                    // Force a fresh load from the database
-                    if (Route == null)
+            if (Route == null || string.IsNullOrEmpty(Route.Id))
                     {
-                        _logger?.LogWarning("Cannot load stops for null route in background");
+                _logger?.LogWarning("No route set for background stop loading");
                         return;
                     }
                     
-                    var stops = _databaseService.GetSortedStopsForRoute(Route.Id);
-                    if (stops.Count == 0)
-                    {
-                        _logger?.LogWarning("No stops found for route {id} in background load", Route.Id);
-                    }
-                    
-                    // Update on main thread if needed
-                    MainThread.BeginInvokeOnMainThread(() =>
+            // Simulate some work on a background thread 
+            await Task.Run(() =>
                     {
                         try
                         {
-                            if (Route == null) return;
-                            
-                            // Only update if we got new data and if the stops collection is empty
-                            if (stops.Count > 0)
-                            {
-                                Route.Stops = stops;
-                                Stops = new ObservableCollection<TransportStop>(stops);
-                                _logger?.LogDebug("Updated stops from background load");
+                    var stops = _databaseService.GetSortedStopsForRoute(Route.Id);
                                 
-                                // Load ETAs after stops are loaded
-                                _ = FetchEtaForStops();
-                                
-                                // Find the nearest stop after stops are loaded from background
-                                if (Stops.Count > 0)
-                                {
-                                    _ = FindAndScrollToNearestStop();
-                                }
-                            }
-                            
-                            IsRefreshing = false;
+                    // ... existing code ...
                         }
                         catch (Exception ex)
                         {
-                            _logger?.LogError(ex, "Error updating UI from background stops load");
-                            IsRefreshing = false;
+                    _logger?.LogError(ex, "Error in background stop loading");
                         }
                     });
                 }
                 catch (Exception ex)
                 {
                     _logger?.LogError(ex, "Error loading stops in background");
-                    MainThread.BeginInvokeOnMainThread(() => IsRefreshing = false);
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Fatal error in LoadStopsInBackground");
-            IsRefreshing = false;
         }
         finally
         {
@@ -1514,38 +1475,16 @@ public partial class RouteDetailsPage : ContentPage
 
     private async Task SaveEtasToDatabase(Dictionary<string, List<TransportEta>> etaData)
     {
-        if (etaData == null || etaData.Count == 0)
-        {
-            return;
-        }
-        
         try
         {
-            // Flatten the dictionary into a list of ETAs
-            List<TransportEta> allEtas = new List<TransportEta>();
-            foreach (var stopEtas in etaData.Values)
-            {
-                if (stopEtas == null)
-                {
-                    continue;
-                }
-                
-                foreach (var eta in stopEtas)
-                {
-                    if (eta != null)
-                    {
-                        allEtas.Add(eta);
-                    }
-                }
-            }
+            // Flatten all ETAs into a single list
+            var allEtas = etaData.Values.SelectMany(list => list).ToList();
             
-            if (allEtas.Count == 0)
+            if (allEtas.Count > 0)
             {
-                return;
-            }
-            
-            // Save to database
+                // Save to database in the background
             await _databaseService.SaveEtas(allEtas);
+            }
         }
         catch (Exception ex)
         {
@@ -1582,7 +1521,9 @@ public partial class RouteDetailsPage : ContentPage
                 return;
             }
             
-            var stopIds = Stops.Select(s => s.StopId).Where(id => !string.IsNullOrEmpty(id)).ToList();
+            var stopIds = Stops.Where(s => s != null && !string.IsNullOrEmpty(s.Id))
+                             .Select(s => s.Id).ToList();
+            
             if (stopIds.Count == 0)
             {
                 return;
@@ -1590,52 +1531,18 @@ public partial class RouteDetailsPage : ContentPage
             
             Dictionary<string, List<TransportEta>> dbEtas = new Dictionary<string, List<TransportEta>>();
             
-            // Get ETAs from database
-            var db = _databaseService.GetDatabase();
-            if (db == null)
-            {
-                _logger?.LogWarning("Database connection is null");
-                return;
-            }
+            // Rather than using GetDatabase which is not accessible, we'll directly get ETAs from the database service
+            var etaData = await _etaService.GetEtasForRouteFromDb(Route.Id, stopIds);
             
-            var params_ = new object[stopIds.Count + 2];
-            params_[0] = Route.Id;
-            for (int i = 0; i < stopIds.Count; i++)
-            {
-                params_[i + 1] = stopIds[i];
-            }
-            // Only get ETAs from the last 2 minutes
-            params_[params_.Length - 1] = DateTime.UtcNow.AddMinutes(-2);
-            
-            var query = "SELECT * FROM TransportEta WHERE RouteId = ? AND StopId IN (" + 
-                        string.Join(",", stopIds.Select(_ => "?")) + ") AND EtaTime > ?";
-            
-            var results = db.Query<TransportEta>(query, params_);
-            
-            foreach (var eta in results)
-            {
-                if (eta == null || string.IsNullOrEmpty(eta.StopId))
-                {
-                    continue;
-                }
-                
-                if (!dbEtas.ContainsKey(eta.StopId))
-                {
-                    dbEtas[eta.StopId] = new List<TransportEta>();
-                }
-                dbEtas[eta.StopId].Add(eta);
-            }
-            
-            // If we have database ETAs, update the UI
-            if (dbEtas.Count > 0)
+            if (etaData != null && etaData.Count > 0)
             {
                 // Update on main thread
                 await MainThread.InvokeOnMainThreadAsync(() => 
                 {
-                    _etaData = dbEtas;
+                    _etaData = etaData;
                     UpdateStopsWithEtaData();
                 });
-                _logger?.LogDebug("Loaded {count} ETAs from database", dbEtas.Sum(pair => pair.Value.Count));
+                _logger?.LogDebug("Loaded {count} ETAs from database", etaData.Sum(pair => pair.Value.Count));
             }
         }
         catch (Exception ex)
@@ -1890,189 +1797,83 @@ public partial class RouteDetailsPage : ContentPage
 
     private void CheckRouteDirections(TransportRoute route)
     {
+        if (route == null) return;
+        
         try
         {
-            if (route == null)
-            {
-                HasTwoDirections = false;
-                return;
-            }
-            
-            // Count how many directions exist for this route in the database
             int directionCount = _databaseService.CountRouteDirections(
                 route.RouteNumber, 
                 route.ServiceType, 
                 route.Operator);
             
-            // Set HasTwoDirections based on actual count
-            HasTwoDirections = directionCount > 1;
+            _hasTwoDirections = directionCount > 1;
             
-            // Log the result
-            _logger?.LogDebug("Route {routeNumber} has {count} directions, HasTwoDirections={hasTwoDirections}", 
-                route.RouteNumber, directionCount, HasTwoDirections);
-            
-            // Get available directions for debugging
-            if (HasTwoDirections)
+            if (_hasTwoDirections)
             {
+                _logger?.LogDebug("Route {route} has multiple directions", route.RouteNumber);
                 var directions = _databaseService.GetRouteDirections(
                     route.RouteNumber, 
                     route.ServiceType, 
                     route.Operator);
                 
-                _logger?.LogDebug("Available directions for route {routeNumber}: {directions}", 
+                _logger?.LogDebug("Available directions for route {route}: {directions}", 
                     route.RouteNumber, string.Join(", ", directions));
             }
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Error checking route directions");
-            HasTwoDirections = false;
+            _hasTwoDirections = false;
         }
     }
     
     private void ReverseRouteDirection()
     {
+        if (Route == null) return;
+        
         try
-        {
-            _logger?.LogInformation("ReverseRouteDirection method called");
-            
-            if (Route == null)
             {
-                _logger?.LogWarning("Route is null, cannot reverse direction");
-                return;
-            }
+            _logger?.LogInformation("Reversing route direction for {route}", Route.RouteNumber);
             
-            if (!HasTwoDirections)
-            {
-                _logger?.LogWarning("Route does not have two directions (HasTwoDirections is false)");
-                return;
-            }
-            
-            // Get current bound
-            var currentBound = Route.Bound;
-            
-            // Get all available directions for this route
+            // Get all possible directions for this route
             var allDirections = _databaseService.GetRouteDirections(
                 Route.RouteNumber, 
                 Route.ServiceType, 
                 Route.Operator);
             
             // Remove the current direction from the list
-            allDirections = allDirections.Where(d => !string.Equals(d, currentBound, StringComparison.OrdinalIgnoreCase)).ToList();
+            var filteredDirections = allDirections.Where(d => d != Route.Bound).ToList();
             
-            if (allDirections.Count == 0)
+            if (filteredDirections.Count == 0)
             {
-                _logger?.LogWarning("No alternative directions found for route {routeNumber}", Route.RouteNumber);
+                _logger?.LogWarning("No alternative directions found for route {route}", Route.RouteNumber);
                 return;
             }
             
-            // For KMB routes with typical inbound/outbound pattern, pick the opposite
-            string oppositeBound;
-            if (allDirections.Count == 1)
-            {
-                // If only one alternative direction, use it
-                oppositeBound = allDirections[0];
-            }
-            else if (currentBound.Equals("i", StringComparison.OrdinalIgnoreCase) && 
-                     allDirections.Any(d => d.Equals("o", StringComparison.OrdinalIgnoreCase)))
-            {
-                // If current is inbound and outbound exists, pick outbound
-                oppositeBound = "o";
-            }
-            else if (currentBound.Equals("o", StringComparison.OrdinalIgnoreCase) && 
-                     allDirections.Any(d => d.Equals("i", StringComparison.OrdinalIgnoreCase)))
-            {
-                // If current is outbound and inbound exists, pick inbound
-                oppositeBound = "i";
-            }
-            else
-            {
-                // Otherwise just pick the first alternative
-                oppositeBound = allDirections[0];
-            }
+            // Get the next direction (usually just one, but we'll handle multiple just in case)
+            string nextDirection = filteredDirections.First();
             
-            _logger?.LogInformation("Reversing route direction from {currentBound} to {oppositeBound} for route {routeNumber}", 
-                currentBound, oppositeBound, Route.RouteNumber);
-            
-            // Find the route with the opposite bound
+            // Get the opposite direction route
             var oppositeRoute = _databaseService.GetRouteByNumberBoundAndServiceType(
-                Route.RouteNumber, oppositeBound, Route.ServiceType, Route.Operator);
+                Route.RouteNumber,
+                nextDirection,
+                Route.ServiceType,
+                Route.Operator);
             
             if (oppositeRoute != null)
             {
-                _logger?.LogInformation("Found opposite route with ID {routeId}", oppositeRoute.Id);
-                
                 // Cancel any ongoing ETA refresh
                 _etaRefreshCts?.Cancel();
                 
-                // Only clear cache for this specific route instead of all caches
-                _etaService.ClearRouteEtaCache(oppositeRoute.RouteNumber, oppositeRoute.ServiceType);
-                
-                // Clear the current ETA data in memory
-                _etaData.Clear();
-                
-                // Set the opposite route
+                // Set the new route
                 SetRoute(oppositeRoute);
                 
-                // Immediately fetch ETAs for the new direction with a longer delay to ensure stops are loaded
-                MainThread.BeginInvokeOnMainThread(async () => {
-                    try
-                    {
-                        // Wait longer for the stops to fully load and initialize
-                        await Task.Delay(3000);
-                        
-                        // Make sure we have stops to fetch ETAs for
-                        if (Stops.Count > 0 && !_isLoadingEta)
-                        {
-                            _logger?.LogInformation("Fetching ETAs for reversed route direction");
-                            
-                            // Perform a fresh ETA fetch directly from API
-                            await Task.Run(async () => {
-                                try {
-                                    _isLoadingEta = true;
-                                    
-                                    // Cancel any ongoing ETA refresh
-                                    _etaRefreshCts?.Cancel();
-                                    _etaRefreshCts?.Dispose();
-                                    _etaRefreshCts = new CancellationTokenSource();
-                                    var token = _etaRefreshCts.Token;
-                                    
-                                    // Force a fresh API fetch instead of using database ETAs
-                                    Dictionary<string, List<TransportEta>>? etaData = await FetchEtasFromApi(token);
-                                    
-                                    if (token.IsCancellationRequested || etaData == null)
-                                    {
-                                        _isLoadingEta = false;
-                                        return;
-                                    }
-                                    
-                                    // Update the UI with fresh ETA data
-                                    _etaData = etaData;
-                                    await MainThread.InvokeOnMainThreadAsync(() => UpdateStopsWithEtaData());
-                                    
-                                    // Save the new ETAs to database
-                                    await SaveEtasToDatabase(etaData);
-                                    
-                                    // Schedule the next refresh
-                                    ScheduleNextEtaRefresh(token);
-                                    
-                                } catch (Exception ex) {
-                                    _logger?.LogError(ex, "Error fetching ETAs after direction change");
-                                } finally {
-                                    _isLoadingEta = false;
-                                }
-                            });
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogError(ex, "Error fetching ETAs after direction change");
-                    }
-                });
+                // Fetch new ETAs
+                _ = FetchEtaForStops();
             }
             else
             {
-                _logger?.LogWarning("Could not find opposite route for {routeId} with bound {bound}", Route.Id, oppositeBound);
+                _logger?.LogWarning("Could not find opposite route for {routeId}", Route.Id);
             }
         }
         catch (Exception ex)

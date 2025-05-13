@@ -35,5 +35,9 @@
 		<key>TemporaryFullAccuracyUsageDescription</key>
 		<string>This app needs full accuracy to find the closest stop to your location.</string>
 	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>

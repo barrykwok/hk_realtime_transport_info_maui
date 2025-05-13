@@ -137,10 +137,14 @@ namespace hk_realtime_transport_info_maui.Services
             var handler = new SocketsHttpHandler
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
                 MaxConnectionsPerServer = options.MaxConcurrentRequests * 2,
-                EnableMultipleHttp2Connections = options.EnableHttp2
+                EnableMultipleHttp2Connections = options.EnableHttp2,
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
+                KeepAlivePingDelay = TimeSpan.FromSeconds(15),
+                ConnectTimeout = TimeSpan.FromSeconds(10),
+                MaxResponseHeadersLength = 64
             };
 
             _httpClient = new HttpClient(handler);
@@ -153,6 +157,7 @@ namespace hk_realtime_transport_info_maui.Services
             
             _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             _httpClient.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
+            _httpClient.DefaultRequestHeaders.ConnectionClose = false;
 
             // Set up concurrency control and queue
             _concurrencyLimiter = new SemaphoreSlim(_maxConcurrentRequests);
@@ -480,15 +485,58 @@ namespace hk_realtime_transport_info_maui.Services
                     
                     var startTime = DateTime.UtcNow;
                     
+                    // For large responses, we need to adjust our strategy - use ResponseHeadersRead instead of ResponseContentRead
+                    HttpCompletionOption completionOption = 
+                        request.Url.Contains("route-stop") ? // Check if this is the large route-stop API call
+                        HttpCompletionOption.ResponseHeadersRead : 
+                        HttpCompletionOption.ResponseContentRead;
+                    
                     // Execute the request with the remaining time from the original timeout
                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
                         request.CancellationToken, 
                         _cancellationTokenSource.Token);
                         
                     // Set a timeout for this specific request
-                    linkedCts.CancelAfter(_httpClient.Timeout);
+                    // For large responses like route-stop, use a longer timeout
+                    var timeout = request.Url.Contains("route-stop") ? 
+                        TimeSpan.FromSeconds(90) : // 90 seconds for route-stop
+                        _httpClient.Timeout;
+                        
+                    linkedCts.CancelAfter(timeout);
                     
-                    var response = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseContentRead, linkedCts.Token);
+                    var response = await _httpClient.SendAsync(requestMessage, completionOption, linkedCts.Token);
+                    
+                    // For large responses with ResponseHeadersRead, we need to ensure the content is read before returning
+                    if (completionOption == HttpCompletionOption.ResponseHeadersRead && response.IsSuccessStatusCode)
+                    {
+                        try
+                        {
+                            // Read the content as a stream to avoid memory issues
+                            var stream = await response.Content.ReadAsStreamAsync(linkedCts.Token);
+                            
+                            // If we got here, the content was successfully read
+                            _logger?.LogDebug("Large response content read successfully for {url}", request.Url);
+                        }
+                        catch (Exception ex)
+                        {
+                            // If we fail to read the content, treat it as a retryable error
+                            _logger?.LogWarning(ex, "Failed to read large response content for {url}, will retry", request.Url);
+                            
+                            // Dispose the response before retrying
+                            response.Dispose();
+                            
+                            if (retryCount < _maxRetryAttempts)
+                            {
+                                retryCount++;
+                                await Task.Delay(delay, linkedCts.Token);
+                                delay = Math.Min(delay * 2, _maxRetryDelayMs);
+                                continue;
+                            }
+                            
+                            // If we're out of retries, rethrow
+                            throw;
+                        }
+                    }
                     
                     var requestDuration = DateTime.UtcNow - startTime;
                     
@@ -508,7 +556,7 @@ namespace hk_realtime_transport_info_maui.Services
                                 response.StatusCode, retryCount, _maxRetryAttempts, request.Url);
                             
                             // Wait before retrying with exponential backoff
-                            await Task.Delay(delay);
+                            await Task.Delay(delay, linkedCts.Token);
                             delay = Math.Min(delay * 2, _maxRetryDelayMs);
                             continue;
                         }
@@ -521,14 +569,14 @@ namespace hk_realtime_transport_info_maui.Services
                 }
                 catch (HttpRequestException ex)
                 {
-                    if (retryCount < _maxRetryAttempts && IsTransientError(ex))
+                    if (retryCount < _maxRetryAttempts && (IsTransientError(ex) || IsNetworkStreamError(ex)))
                     {
                         retryCount++;
                         _logger?.LogWarning(ex, "Transient error on attempt {attemptNumber}, retrying after {delay}ms: {url}", 
                             retryCount, delay, request.Url);
                         
                         // Wait before retrying with exponential backoff
-                        await Task.Delay(delay);
+                        await Task.Delay(delay, request.CancellationToken);
                         delay = Math.Min(delay * 2, _maxRetryDelayMs);
                         continue;
                     }
@@ -546,7 +594,7 @@ namespace hk_realtime_transport_info_maui.Services
                             retryCount, delay, request.Url);
                         
                         // Wait before retrying with exponential backoff
-                        await Task.Delay(delay);
+                        await Task.Delay(delay, request.CancellationToken);
                         delay = Math.Min(delay * 2, _maxRetryDelayMs);
                         continue;
                     }
@@ -555,8 +603,42 @@ namespace hk_realtime_transport_info_maui.Services
                         retryCount + 1, request.Url);
                     throw;
                 }
+                catch (ObjectDisposedException ex) when (ex.ObjectName?.Contains("NetworkStream") == true)
+                {
+                    // This is the specific exception we're seeing in logs
+                    if (retryCount < _maxRetryAttempts)
+                    {
+                        retryCount++;
+                        _logger?.LogWarning(ex, "NetworkStream disposed on attempt {attemptNumber}, retrying after {delay}ms: {url}", 
+                            retryCount, delay, request.Url);
+                        
+                        // Wait before retrying with exponential backoff
+                        await Task.Delay(delay, request.CancellationToken);
+                        delay = Math.Min(delay * 2, _maxRetryDelayMs);
+                        continue;
+                    }
+                    
+                    _logger?.LogError(ex, "HTTP request failed with NetworkStream disposed after {attemptNumber} attempts: {url}", 
+                        retryCount + 1, request.Url);
+                    throw;
+                }
                 catch (Exception ex)
                 {
+                    // Check for network stream disposed issues in inner exception
+                    if (retryCount < _maxRetryAttempts && 
+                        (ex.Message.Contains("NetworkStream") || 
+                        (ex.InnerException != null && ex.InnerException.Message.Contains("NetworkStream"))))
+                    {
+                        retryCount++;
+                        _logger?.LogWarning(ex, "Network stream error on attempt {attemptNumber}, retrying after {delay}ms: {url}", 
+                            retryCount, delay, request.Url);
+                        
+                        // Wait before retrying with exponential backoff
+                        await Task.Delay(delay, request.CancellationToken);
+                        delay = Math.Min(delay * 2, _maxRetryDelayMs);
+                        continue;
+                    }
+                    
                     _logger?.LogError(ex, "Unexpected error executing HTTP request to {url}: {message}", 
                         request.Url, ex.Message);
                         
@@ -809,6 +891,24 @@ namespace hk_realtime_transport_info_maui.Services
             
             return results;
         }
+
+        // Add a helper method to check for network stream errors
+        private bool IsNetworkStreamError(Exception ex)
+        {
+            // Check the message of this exception and any inner exceptions for network stream errors
+            if (ex.Message.Contains("NetworkStream") || ex.Message.Contains("network stream"))
+                return true;
+                
+            if (ex.InnerException != null)
+            {
+                return ex.InnerException.Message.Contains("NetworkStream") || 
+                       ex.InnerException.Message.Contains("network stream") ||
+                       ex.InnerException.Message.Contains("disposed") ||
+                       ex.InnerException.Message.Contains("read operation");
+            }
+            
+            return false;
+        }
     }
 
     /// <summary>
@@ -816,11 +916,11 @@ namespace hk_realtime_transport_info_maui.Services
     /// </summary>
     public class HttpClientUtilityOptions
     {
-        public int MaxConcurrentRequests { get; set; } = 8;
+        public int MaxConcurrentRequests { get; set; } = 6;
         public int MaxRetryAttempts { get; set; } = 3;
         public int InitialRetryDelayMs { get; set; } = 1000;
         public int MaxRetryDelayMs { get; set; } = 15000;
-        public int TimeoutSeconds { get; set; } = 30;
+        public int TimeoutSeconds { get; set; } = 60;
         public string AppVersion { get; set; } = "1.0.0";
         public bool EnableResponseCaching { get; set; } = true;
         public bool EnableHttp2 { get; set; } = true; // Add HTTP/2 support option

@@ -22,7 +22,7 @@ namespace hk_realtime_transport_info_maui.Services
     public class EtaService
     {
         private readonly HttpClient _httpClient;
-        private readonly DatabaseService _databaseService;
+        private readonly LiteDbService _databaseService;
         private readonly ILogger<EtaService> _logger;
         private readonly string _kmbStopEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/eta";
         private readonly string _kmbRouteEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/route-eta";
@@ -48,7 +48,30 @@ namespace hk_realtime_transport_info_maui.Services
         private DateTime _lastRequestTime = DateTime.MinValue;
         private const int MinRequestIntervalMs = 300; // Minimum time between API requests
 
-        public EtaService(HttpClient httpClient, DatabaseService databaseService, ILogger<EtaService> logger, CacheService cacheService)
+        // Add a priority queue-based ETA fetching approach
+        private readonly ConcurrentQueue<EtaFetchRequest> _etaFetchQueue = new ConcurrentQueue<EtaFetchRequest>();
+        private readonly SemaphoreSlim _etaQueueSemaphore = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _processingFlag = new SemaphoreSlim(1, 1);
+        private bool _isProcessingQueue = false;
+
+        // Structure to track ETA fetch requests
+        private class EtaFetchRequest
+        {
+            public string StopId { get; set; }
+            public string? RouteNumber { get; set; }
+            public string? ServiceType { get; set; }
+            public int Priority { get; set; } // Lower number = higher priority
+            public TaskCompletionSource<List<TransportEta>> CompletionSource { get; set; } = new TaskCompletionSource<List<TransportEta>>();
+        }
+
+        // Add these fields at the top of the class, right after the existing fields
+        private readonly ConcurrentDictionary<string, Task<List<TransportEta>>> _pendingEtaRequests = 
+            new ConcurrentDictionary<string, Task<List<TransportEta>>>();
+        private readonly ConcurrentDictionary<string, bool> _stopHasNoEtas = 
+            new ConcurrentDictionary<string, bool>();
+        private DateTime _lastEtaRequestTime = DateTime.MinValue;
+
+        public EtaService(HttpClient httpClient, LiteDbService databaseService, ILogger<EtaService> logger, CacheService cacheService)
         {
             _httpClient = httpClient;
             _databaseService = databaseService;
@@ -186,8 +209,8 @@ namespace hk_realtime_transport_info_maui.Services
                                 continue;
                             }
                             
-                            // Generate a deterministic ID based on route, stop, and ETA time
-                            string etaId = $"{routeNumber}_{stopId}_{etaData.EtaSeq}_{etaTime:yyyyMMddHHmmss}";
+                            // Restore the correct parameters
+                            string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
 
                             // Calculate minutes remaining
                             TimeSpan timeRemaining = etaTime - now;
@@ -197,9 +220,10 @@ namespace hk_realtime_transport_info_maui.Services
                             {
                                 Id = etaId,
                                 StopId = etaData.StopId ?? string.Empty, // Ensure StopId is never null
+                                RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
                                 RouteNumber = etaData.Route ?? string.Empty, // Fix null warning
                                 Direction = etaData.Dir ?? string.Empty, // Fix null warning
-                                ServiceType = etaData.ServiceType.ToString(), // Convert int to string
+                                ServiceType = serviceType,
                                 FetchTime = now,
                                 Remarks = etaData.Remarks ?? string.Empty, // Ensure Remarks is never null
                                 EtaTime = etaTime,
@@ -457,8 +481,8 @@ namespace hk_realtime_transport_info_maui.Services
                                     continue;
                                 }
                                 
-                                // Generate a deterministic ID based on route, stop, and ETA time
-                                string etaId = $"{routeNumber}_{stopId}_{etaData.EtaSeq}_{etaTime:yyyyMMddHHmmss}";
+                                // Restore the correct parameters
+                                string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
                                 
                                 // Calculate minutes remaining
                                 TimeSpan timeRemaining = etaTime - now;
@@ -468,7 +492,8 @@ namespace hk_realtime_transport_info_maui.Services
                                 {
                                     Id = etaId,
                                     StopId = stopId,
-                                    RouteNumber = routeNumber,
+                                    RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
+                                    RouteNumber = etaData.Route ?? string.Empty,
                                     Direction = etaData.Dir ?? string.Empty, // Fix null warning
                                     ServiceType = serviceType,
                                     FetchTime = now,
@@ -612,7 +637,7 @@ namespace hk_realtime_transport_info_maui.Services
         /// <summary>
         /// Converts the KMB ETA API response to our internal TransportEta model
         /// </summary>
-        private List<TransportEta> ConvertKmbEtas(KmbEtaResponse etaResponse, string? queryStopId = null)
+        private List<TransportEta> ConvertKmbEtas(KmbEtaResponse etaResponse, string serviceType, string? queryStopId = null)
         {
             if (etaResponse?.Data == null || etaResponse.Data.Count == 0)
             {
@@ -663,8 +688,8 @@ namespace hk_realtime_transport_info_maui.Services
                     continue;
                 }
                 
-                // Generate a deterministic ID based on route, stop, and ETA time
-                string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaTime:yyyyMMddHHmmss}";
+                // Restore the correct parameters
+                string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
                 
                 // Calculate minutes remaining
                 TimeSpan timeRemaining = etaTime - now;
@@ -674,9 +699,10 @@ namespace hk_realtime_transport_info_maui.Services
                 {
                     Id = etaId,
                     StopId = etaData.StopId ?? string.Empty, // Ensure StopId is never null
+                    RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
                     RouteNumber = etaData.Route ?? string.Empty, // Fix null warning
                     Direction = etaData.Dir ?? string.Empty, // Fix null warning
-                    ServiceType = etaData.ServiceType.ToString(), // Convert int to string
+                    ServiceType = serviceType,
                     FetchTime = now,
                     Remarks = etaData.Remarks ?? string.Empty, // Ensure Remarks is never null
                     EtaTime = etaTime,
@@ -782,7 +808,9 @@ namespace hk_realtime_transport_info_maui.Services
                         
                         // Convert the API response to our TransportEta model
                         // Pass the stopId as queryStopId parameter to handle ETAs with empty stop IDs
-                        var result = ConvertKmbEtas(kmbResponse, stopId);
+                        // Extract service type from the first ETA data item or use "1" as default
+                        string serviceType = kmbResponse.Data.FirstOrDefault()?.ServiceType.ToString() ?? "1";
+                        var result = ConvertKmbEtas(kmbResponse, serviceType, stopId);
                         
                         // Log success
                         _logger?.LogDebug("Successfully retrieved {count} ETAs for KMB stop {kmbStopId}", 
@@ -966,6 +994,268 @@ namespace hk_realtime_transport_info_maui.Services
         
             // If not in cache, fetch new data
             return await FetchAllKmbEtaForStop(stopId);
+        }
+
+        /// <summary>
+        /// Gets ETAs for a specific route and set of stops from the database
+        /// </summary>
+        /// <param name="routeId">The route ID</param>
+        /// <param name="stopIds">List of stop IDs to fetch ETAs for</param>
+        /// <returns>Dictionary of stop IDs to list of ETAs</returns>
+        public async Task<Dictionary<string, List<TransportEta>>> GetEtasForRouteFromDb(string routeId, List<string> stopIds)
+        {
+            var result = new Dictionary<string, List<TransportEta>>();
+            
+            try
+            {
+                if (string.IsNullOrEmpty(routeId) || stopIds == null || stopIds.Count == 0)
+                {
+                    return result;
+                }
+                
+                // Only get ETAs from the last 5 minutes to ensure they're still relevant
+                var cutoffTime = DateTime.UtcNow.AddMinutes(-5);
+                
+                // Get all ETAs for this route that match the stop IDs
+                var allEtas = _databaseService.GetAllRecords<TransportEta>("TransportEtas")
+                    .Where(eta => 
+                        eta.RouteId == routeId && 
+                        stopIds.Contains(eta.StopId) && 
+                        eta.EtaTime > cutoffTime)
+                    .ToList();
+                
+                // Group ETAs by stop ID
+                foreach (var eta in allEtas)
+                {
+                    if (!result.ContainsKey(eta.StopId))
+                    {
+                        result[eta.StopId] = new List<TransportEta>();
+                    }
+                    
+                    result[eta.StopId].Add(eta);
+                }
+                
+                // Log what we found
+                _logger?.LogDebug("Found {count} ETAs for route {routeId} in database", 
+                    allEtas.Count, routeId);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error getting ETAs from database for route {routeId}", routeId);
+            }
+            
+            return result;
+        }
+
+        // Queue an ETA fetch request and get a Task that will complete when the data is available
+        public Task<List<TransportEta>> QueueEtaFetchRequest(string stopId, string? routeNumber = null, string? serviceType = null, int priority = 5)
+        {
+            // Check if we already have this in cache first
+            string cacheKey = routeNumber != null && serviceType != null 
+                ? $"eta_kmb_{stopId}_{routeNumber}_{serviceType}"
+                : $"eta_kmb_all_{stopId}";
+            
+            if (_cacheService.TryGetValue(cacheKey, out List<TransportEta>? cachedEtas) && cachedEtas != null)
+            {
+                _logger?.LogDebug("QueueEtaFetchRequest: Using cached ETAs for stop {stopId}", stopId);
+                return Task.FromResult(cachedEtas);
+            }
+            
+            var request = new EtaFetchRequest
+            {
+                StopId = stopId,
+                RouteNumber = routeNumber,
+                ServiceType = serviceType,
+                Priority = priority
+            };
+            
+            _etaFetchQueue.Enqueue(request);
+            
+            // Start the processing task if it's not already running
+            Task.Run(() => EnsureQueueProcessing());
+            
+            return request.CompletionSource.Task;
+        }
+
+        // Ensure the queue processing task is running
+        private async Task EnsureQueueProcessing()
+        {
+            if (_isProcessingQueue)
+                return;
+        
+            // Use semaphore to ensure only one thread tries to start processing
+            await _processingFlag.WaitAsync();
+        
+            try
+            {
+                if (_isProcessingQueue)
+                    return;
+            
+                _isProcessingQueue = true;
+            
+                // Start processing task
+                _ = Task.Run(ProcessEtaQueue);
+            }
+            finally
+            {
+                _processingFlag.Release();
+            }
+        }
+
+        // Process the ETA queue
+        private async Task ProcessEtaQueue()
+        {
+            try
+            {
+                while (_etaFetchQueue.TryDequeue(out var request))
+                {
+                    try
+                    {
+                        List<TransportEta> result;
+                        
+                        // Process this request
+                        if (request.RouteNumber != null && request.ServiceType != null)
+                        {
+                            // Specific route ETA
+                            result = await FetchKmbEtaForStop(request.StopId, request.RouteNumber, request.ServiceType);
+                        }
+                        else
+                        {
+                            // All ETAs for a stop
+                            result = await FetchAllKmbEtaForStop(request.StopId);
+                        }
+                        
+                        // Complete the task with the result
+                        request.CompletionSource.SetResult(result);
+                        
+                        // Apply rate limiting between requests
+                        await ApplyRateLimiting();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Error processing ETA request for stop {stopId}", request.StopId);
+                        request.CompletionSource.SetException(ex);
+                    }
+                }
+            }
+            finally
+            {
+                // Mark processing as complete
+                _isProcessingQueue = false;
+            
+                // Check if new items were added to the queue while we were processing
+                if (!_etaFetchQueue.IsEmpty)
+                {
+                    await Task.Delay(100); // Small delay to avoid CPU spinning
+                    _ = Task.Run(ProcessEtaQueue);
+                }
+            }
+        }
+
+        // Add this method to optimize ETA fetching with batching and better caching
+        public async Task<List<TransportEta>> FetchAllKmbEtaForStopOptimized(string stopId, string? queryStopId = null)
+        {
+            try
+            {
+                // First check cache to avoid unnecessary API calls
+                string cacheKey = $"eta_kmb_all_{stopId}";
+                if (_cacheService.TryGetValue(cacheKey, out List<TransportEta> cachedEtas))
+                {
+                    _logger?.LogDebug("Using cached ETAs for stop {stopId}", stopId);
+                    return cachedEtas;
+                }
+
+                // Check if we already have a pending request for this stop
+                if (_pendingEtaRequests.TryGetValue(stopId, out var pendingTask))
+                {
+                    _logger?.LogDebug("Reusing pending ETA request for stop {stopId}", stopId);
+                    return await pendingTask;
+                }
+
+                // Create a new task completion source for this request
+                var tcs = new TaskCompletionSource<List<TransportEta>>();
+                _pendingEtaRequests[stopId] = tcs.Task;
+
+                try
+                {
+                    // Apply rate limiting based on last request time
+                    await ApplyRateLimiting();
+                    
+                    // Skip delays for stops we've never fetched or that had ETAs previously
+                    bool skipDelay = !_stopHasNoEtas.ContainsKey(stopId) || !_stopHasNoEtas[stopId];
+                    
+                    if (!skipDelay)
+                    {
+                        _logger?.LogDebug("Skipping API rate limiting for stop {stopId} as previous request had no ETAs", stopId);
+                    }
+                    
+                    // Record the time of this request
+                    _lastRequestTime = DateTime.Now;
+
+                    // Make the API request using existing httpClient
+                    string url = $"{_kmbStopEtaBaseUrl}/stop-eta/{stopId}";
+                    
+                    HttpResponseMessage response = await _httpClient.GetAsync(url);
+                    
+                    if (response.IsSuccessStatusCode)
+                    {
+                        // Read the response as JSON
+                        var responseData = await response.Content.ReadAsStreamAsync();
+                        var kmbResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(responseData, _jsonOptions);
+                        
+                        if (kmbResponse?.Data == null)
+                        {
+                            _logger?.LogWarning("KMB ETA API returned null response or data for stop {kmbStopId}", stopId);
+                            _stopHasNoEtas[stopId] = true;
+                            var emptyList = new List<TransportEta>();
+                            tcs.SetResult(emptyList);
+                            _cacheService.Set(cacheKey, emptyList, TimeSpan.FromSeconds(15));
+                            _pendingEtaRequests.TryRemove(stopId, out _);
+                            return emptyList;
+                        }
+                        
+                        _logger?.LogDebug("Processing ETAs for KMB stop {kmbStopId} with auto-assignment of stop ID for ETAs with empty stop ID", stopId);
+                        
+                        // Convert to internal format
+                        var result = ConvertKmbEtas(kmbResponse, "1", stopId);
+                        
+                        // Cache the results - use a shorter expiration for stops with no ETAs
+                        TimeSpan cacheExpiry = result.Count > 0 ? TimeSpan.FromSeconds(25) : TimeSpan.FromSeconds(15);
+                        _cacheService.Set(cacheKey, result, cacheExpiry);
+                        
+                        // Record if this stop has ETAs
+                        _stopHasNoEtas[stopId] = result.Count == 0;
+                        
+                        // Complete the task
+                        tcs.SetResult(result);
+                        _pendingEtaRequests.TryRemove(stopId, out _);
+                        
+                        _logger?.LogDebug("Successfully retrieved {count} ETAs for KMB stop {kmbStopId}", result.Count, stopId);
+                        return result;
+                    }
+                    else
+                    {
+                        _logger?.LogWarning("KMB ETA API returned error status code for stop {kmbStopId}: {status}", 
+                            stopId, response.StatusCode);
+                        var emptyList = new List<TransportEta>();
+                        tcs.SetResult(emptyList);
+                        _pendingEtaRequests.TryRemove(stopId, out _);
+                        return emptyList;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error fetching ETAs from KMB API for stop {kmbStopId}", stopId);
+                    tcs.SetException(ex);
+                    _pendingEtaRequests.TryRemove(stopId, out _);
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error in FetchAllKmbEtaForStopOptimized for stop {kmbStopId}", stopId);
+                return new List<TransportEta>();
+            }
         }
     }
 } 

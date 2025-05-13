@@ -11,7 +11,7 @@ namespace hk_realtime_transport_info_maui.Services
     /// </summary>
     public class AppBackgroundService
     {
-        private readonly DatabaseService _databaseService;
+        private readonly LiteDbService _databaseService;
         private readonly ILogger<AppBackgroundService> _logger;
         private CancellationTokenSource? _cancellationTokenSource;
         private bool _isRunning;
@@ -19,7 +19,7 @@ namespace hk_realtime_transport_info_maui.Services
         // Interval for database optimization (once per day when app is idle)
         private readonly TimeSpan _optimizationInterval = TimeSpan.FromDays(1);
         
-        public AppBackgroundService(DatabaseService databaseService, ILogger<AppBackgroundService> logger)
+        public AppBackgroundService(LiteDbService databaseService, ILogger<AppBackgroundService> logger)
         {
             _databaseService = databaseService;
             _logger = logger;
