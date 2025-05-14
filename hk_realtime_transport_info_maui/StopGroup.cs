@@ -86,15 +86,15 @@ namespace hk_realtime_transport_info_maui
         /// <summary>
         /// Updates the ETAs for a specific route in this stop group
         /// </summary>
-        public void UpdateEtas(string routeNumber, string serviceType, List<TransportEta> etas)
+        public void UpdateEtas(string routeNumber, string serviceType, string bound, List<TransportEta> etas)
         {
             if (string.IsNullOrEmpty(routeNumber) || etas == null)
             {
                 return;
             }
             
-            // Create a key from route number and service type
-            string key = $"{routeNumber}_{serviceType}";
+            // Create a key from route number, service type, and bound
+            string key = $"{routeNumber}_{serviceType}_{bound?.ToUpperInvariant() ?? string.Empty}";
             
             bool hasEtasBefore = HasEtas;
             
@@ -157,9 +157,9 @@ namespace hk_realtime_transport_info_maui
         public bool HasAnyVisibleRoutesWithEta => _routesWithEtaCount > 0;
 
         // Get ETA for a specific route
-        public TransportEta? GetEtaForRoute(string routeNumber, string serviceType)
+        public TransportEta? GetEtaForRoute(string routeNumber, string serviceType, string bound)
         {
-            string key = $"{routeNumber}_{serviceType}";
+            string key = $"{routeNumber}_{serviceType}_{bound?.ToUpperInvariant() ?? string.Empty}";
             if (_routeEtas.TryGetValue(key, out var etas) && etas.Count > 0)
             {
                 // Return the first (earliest) ETA
@@ -170,9 +170,9 @@ namespace hk_realtime_transport_info_maui
         }
 
         // Get all ETAs for a route (for cases where we want to show multiple ETAs)
-        public List<TransportEta> GetAllEtasForRoute(string routeNumber, string serviceType)
+        public List<TransportEta> GetAllEtasForRoute(string routeNumber, string serviceType, string bound)
         {
-            string key = $"{routeNumber}_{serviceType}";
+            string key = $"{routeNumber}_{serviceType}_{bound?.ToUpperInvariant() ?? string.Empty}";
             if (_routeEtas.TryGetValue(key, out var etas))
             {
                 return etas;

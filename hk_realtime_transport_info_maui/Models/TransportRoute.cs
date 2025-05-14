@@ -179,8 +179,7 @@ namespace hk_realtime_transport_info_maui.Models
         { 
             get 
             {
-                // For debugging
-                System.Diagnostics.Debug.WriteLine($"FirstEta for {RouteNumber}: '{FirstEta}'");
+                // For debugging - REMOVED: System.Diagnostics.Debug.WriteLine($"FirstEta for {RouteNumber}: '{FirstEta}'");
                 return !string.IsNullOrEmpty(FirstEta) ? FirstEta : string.Empty;
             }
         }
@@ -193,8 +192,7 @@ namespace hk_realtime_transport_info_maui.Models
             get 
             {
                 var hasEta = !string.IsNullOrEmpty(FirstEta);
-                // For debugging
-                System.Diagnostics.Debug.WriteLine($"HasEta for {RouteNumber}: {hasEta}");
+                // For debugging - REMOVED: System.Diagnostics.Debug.WriteLine($"HasEta for {RouteNumber}: {hasEta}");
                 return hasEta;
             }
         }

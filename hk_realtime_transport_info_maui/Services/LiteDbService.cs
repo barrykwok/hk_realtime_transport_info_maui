@@ -809,50 +809,147 @@ namespace hk_realtime_transport_info_maui.Services
         public async Task<List<TransportRoute>> GetRoutesForStopAsync(string stopId)
         {
             // Check cache first
-            if (_routesByStopCache != null && 
-                _routesByStopCache.TryGetValue(stopId, out var cachedResult) && 
-                (DateTime.Now - cachedResult.Item1).TotalMinutes < 10)
+            if (_routesByStopCache != null && _routesByStopCache.TryGetValue(stopId, out var cachedEntry))
             {
-                return cachedResult.Item2;
+                // Check if cache entry is still valid (e.g., within 1 hour)
+                if (DateTime.UtcNow - cachedEntry.Item1 < TimeSpan.FromHours(1))
+                {
+                    _logger?.LogDebug("Returning cached routes for stop {stopId}", stopId);
+                    return cachedEntry.Item2;
+                }
+                else
+                {
+                    // Cache entry expired, remove it
+                    _routesByStopCache.TryRemove(stopId, out _);
+                }
             }
-            
-            return await Task.Run(() =>
+
+            var routes = new List<TransportRoute>();
+            try
             {
                 var db = GetDatabase();
-                var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
                 var relationCollection = db.GetCollection<RouteStopRelation>("RouteStopRelations");
-                
-                // Get all route IDs that include this stop
-                var routeIds = relationCollection
-                    .Find(Query.EQ("StopId", stopId))
-                    .Select(r => r.RouteId)
-                    .Distinct()
-                    .ToList();
-                
-                if (!routeIds.Any())
-                    return new List<TransportRoute>();
-            
-                // Get the actual routes
-                var routes = new List<TransportRoute>();
-                foreach (var routeId in routeIds)
+                var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
+
+                // Trim stopId and log information
+                var trimmedStopId = stopId?.Trim();
+                if (string.IsNullOrEmpty(trimmedStopId))
                 {
-                    var route = routeCollection.FindById(routeId);
-                    if (route != null)
+                    _logger?.LogWarning("GetRoutesForStopAsync received null or empty stopId.");
+                    return routes; // Return empty list
+                }
+                _logger?.LogDebug("Querying relations for trimmed StopId: '{trimmedStopId}'. Original was: '{originalStopId}'", trimmedStopId, stopId);
+
+
+                // Find relations for the stop
+                var relations = relationCollection.Find(r => r.StopId == trimmedStopId).ToList();
+                
+                _logger?.LogDebug("Found {relationCount} relations for stopId '{trimmedStopId}'. Total relations in DB: {totalRelations}", relations.Count, trimmedStopId, relationCollection.Count());
+
+                if (relations.Any())
+                {
+                    var routeIds = relations.Select(r => r.RouteId?.Trim()).Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
+                    _logger?.LogDebug("Extracted {count} distinct, trimmed RouteIds for stopId '{stopId}'. Sample IDs: {sampleIds}", 
+                        routeIds.Count, trimmedStopId, string.Join(", ", routeIds.Take(5)));
+
+                    if (routeIds.Any())
                     {
-                        routes.Add(route);
+                        // Diagnostic: Try fetching one route directly
+                        var firstRouteIdToTest = routeIds.First();
+                        var testRoute = routeCollection.FindById(new BsonValue(firstRouteIdToTest));
+                        _logger?.LogDebug("Diagnostic: Attempted to fetch route with ID '{testId}' directly. Found: {wasFound}", 
+                            firstRouteIdToTest, testRoute != null);
+                        if (testRoute != null) {
+                            _logger?.LogDebug("Diagnostic: Test route details - ID: {routeId}, Number: {routeNum}, Operator: {routeOp}", testRoute.Id, testRoute.RouteNumber, testRoute.Operator.ToString());
+                        }
+
+                        // Fetch routes individually as Query.In seems to have issues with string IDs that might be ObjectIds
+                        var foundRoutes = new List<TransportRoute>();
+                        foreach (var routeId in routeIds)
+                        {
+                            var route = routeCollection.FindById(new BsonValue(routeId!));
+                            if (route != null)
+                            {
+                                foundRoutes.Add(route);
+                            }
+                            else
+                            {
+                                _logger?.LogWarning("Could not find route with ID '{routeId}' for stop '{stopId}' using FindById, though it was in relations.", routeId, trimmedStopId);
+                            }
+                        }
+                        routes = foundRoutes;
+                        _logger?.LogDebug("After fetching individually, found {count} routes for stopId '{stopId}'", routes.Count, trimmedStopId);
+                    }
+                    else
+                    {
+                        _logger?.LogWarning("No valid RouteIds found after trimming and filtering for stopId '{stopId}'", trimmedStopId);
                     }
                 }
                 
-                // Cache the result
-                if (_routesByStopCache == null)
+                _logger?.LogDebug("Found {count} routes for stop {stopId} from database", routes.Count, trimmedStopId);
+
+                // Update cache only if routes were found
+                if (routes.Any())
                 {
-                    _routesByStopCache = new ConcurrentDictionary<string, Tuple<DateTime, List<TransportRoute>>>();
+                    _routesByStopCache ??= new ConcurrentDictionary<string, Tuple<DateTime, List<TransportRoute>>>();
+                    _routesByStopCache[trimmedStopId] = new Tuple<DateTime, List<TransportRoute>>(DateTime.UtcNow, routes);
                 }
+                else
+                {
+                    // If an old cached entry existed (potentially with routes), 
+                    // and now no routes are found, remove the old entry.
+                    // This prevents serving stale data if routes for a stop are removed or relations change.
+                    if (_routesByStopCache != null && _routesByStopCache.ContainsKey(trimmedStopId))
+                    {
+                        _routesByStopCache.TryRemove(trimmedStopId, out _);
+                        _logger?.LogDebug("Removed prior cached entry for stop {stopId} as no routes are currently found.", trimmedStopId);
+                    }
+                    else
+                    {
+                        _logger?.LogDebug("No routes found for stop {stopId}, and no prior cache entry existed. Not caching empty list.", trimmedStopId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error getting routes for stop {stopId}", stopId);
+            }
+            return routes;
+        }
+        
+        public List<TransportStop> GetStopsByGeoHash6List(IEnumerable<string> geoHash6Values)
+        {
+            if (geoHash6Values == null || !geoHash6Values.Any())
+            {
+                return new List<TransportStop>();
+            }
+
+            try
+            {
+                var db = GetDatabase();
+                var stopCollection = db.GetCollection<TransportStop>("TransportStops");
                 
-                _routesByStopCache[stopId] = new Tuple<DateTime, List<TransportRoute>>(DateTime.Now, routes);
+                // Ensure the input is a list for BsonArray conversion
+                var geoHashList = geoHash6Values.ToList();
+                if (!geoHashList.Any())
+                {
+                    return new List<TransportStop>();
+                }
+
+                var bsonGeoHashArray = new BsonArray(geoHashList.Select(gh => new BsonValue(gh)));
                 
-                return routes;
-            });
+                _logger?.LogDebug("Querying stops with GeoHash6 values: {GeoHashes}", string.Join(",", geoHashList));
+
+                var stops = stopCollection.Find(Query.In("GeoHash6", bsonGeoHashArray)).ToList();
+                
+                _logger?.LogDebug("Found {Count} stops matching GeoHash6 list.", stops.Count);
+                return stops;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error getting stops by GeoHash6 list.");
+                return new List<TransportStop>();
+            }
         }
         
         public bool CheckAndRepairDatabase()

@@ -1823,21 +1823,30 @@ public partial class MainPage : ContentPage
 		_logger?.LogDebug("UpdateNearbyStops: User location geohash: GH6={0}, GH7={1}, GH8={2}", 
 			userGeoHash6, userGeoHash7, userGeoHash8);
 		
-		// Create a CancellationTokenSource for GetAllStopsAsync to allow canceling if it takes too long
-		using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+		// Create a CancellationTokenSource for the database call to allow canceling if it takes too long
+		using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // Increased timeout slightly for this targeted query
 		
-		// Get all stops from database with timeout
+		// Get relevant GeoHash6 areas (user's and neighbors)
+		var neighboringGeoHashes = GetNeighboringGeohashes(userGeoHash6); // This method returns an array including the center
+		
+		// Get stops only from relevant GeoHash6 areas from the database
 		var allStops = await Task.Run(async () => {
 			try {
-				return await _databaseService.GetAllStopsAsync().WaitAsync(timeoutCts.Token);
+				// Call the new method to get stops by a list of GeoHash6 values
+				return await Task.FromResult(_databaseService.GetStopsByGeoHash6List(neighboringGeoHashes)).WaitAsync(timeoutCts.Token);
 			}
 			catch (OperationCanceledException) {
-				_logger?.LogWarning("GetAllStopsAsync timed out after 3 seconds");
+				_logger?.LogWarning("GetStopsByGeoHash6List timed out after 5 seconds");
+				return new List<TransportStop>();
+			}
+			catch (Exception ex)
+			{
+				_logger?.LogError(ex, "Error calling GetStopsByGeoHash6List");
 				return new List<TransportStop>();
 			}
 		});
 		
-		_logger?.LogDebug("UpdateNearbyStops: Got {0} stops from database", allStops.Count);
+		_logger?.LogDebug("UpdateNearbyStops: Got {0} stops from database using GeoHash6 list", allStops.Count);
 		
 		// Log a sample of stops to check their geohash values
 		if (allStops.Count > 0)
@@ -1851,7 +1860,6 @@ public partial class MainPage : ContentPage
 			}
 		}
 		
-		// First use geohash to filter potential nearby stops
 		// This is much faster than calculating exact distances for all stops
 		var potentialNearbyStops = new List<TransportStop>();
 		
@@ -1859,78 +1867,54 @@ public partial class MainPage : ContentPage
 		_logger?.LogDebug("Looking for stops near: Lat={0}, Lng={1}, GH6={2}, GH7={3}, GH8={4}",
 			_userLocation.Latitude, _userLocation.Longitude, userGeoHash6, userGeoHash7, userGeoHash8);
 		
-		// IMPROVED GEOHASH APPROACH
-		// First, get neighboring geohashes to handle boundary cases
-		var neighbors = GetNeighboringGeohashes(userGeoHash6);
-		_logger?.LogDebug("Including neighboring geohashes: {0}", string.Join(", ", neighbors));
-		
-		// Keep track of stops we find via geohash
-		HashSet<string> foundStopIds = new HashSet<string>();
-		
-		// Use a multi-level geohash matching strategy with neighbors
-		foreach (var stop in allStops)
+		// The geohash filtering logic below can be simplified or adjusted now, 
+        // as `allStops` already contains stops from the relevant GeoHash6 areas.
+        // We still need to calculate exact distances and filter by the 1km radius.
+
+		// Keep track of stops we find (not strictly necessary to avoid duplicates if allStops is already pre-filtered by GH6)
+		HashSet<string> foundStopIds = new HashSet<string>(); 
+
+		foreach (var stop in allStops) // Iterate over the already GeoHash6-filtered list
 		{
 			if (stop.Latitude == 0 && stop.Longitude == 0) continue;
 			
-			bool isNearbyByGeohash = false;
+			// Calculate actual distance to verify proximity
+			var stopLocation = new Location(stop.Latitude, stop.Longitude);
+			double distanceInMeters = Location.CalculateDistance(
+				new Location(_userLocation.Latitude, _userLocation.Longitude), 
+				stopLocation, DistanceUnits.Kilometers) * 1000;
 			
-			// Try the most precise match first (GeoHash8 - 5 characters)
-			if (!string.IsNullOrEmpty(stop.GeoHash8) && userGeoHash8.Length >= 5 && stop.GeoHash8.Length >= 5)
+			// Use a slightly larger radius (e.g., 1000m or 1200m, as GeoHash6 cells can be up to 1.22km wide)
+            // for this initial collection of `potentialNearbyStops`.
+            // The final bucketing into 100m, 200m, etc., will use precise distances.
+			if (distanceInMeters <= 1200) // Increased radius slightly to ensure cells at edges are included
 			{
-				isNearbyByGeohash = userGeoHash8.Substring(0, 5) == stop.GeoHash8.Substring(0, 5);
-			}
-			
-			// Next try GeoHash7 with more precision
-			if (!isNearbyByGeohash && !string.IsNullOrEmpty(stop.GeoHash7) && 
-				userGeoHash7.Length >= 4 && stop.GeoHash7.Length >= 4)
-			{
-				isNearbyByGeohash = userGeoHash7.Substring(0, 4) == stop.GeoHash7.Substring(0, 4);
-			}
-			
-			// Finally check with neighbors at GeoHash6 level (for boundary areas)
-			if (!isNearbyByGeohash && !string.IsNullOrEmpty(stop.GeoHash6) && stop.GeoHash6.Length >= 3)
-			{
-				// First try direct match with current geohash
-				isNearbyByGeohash = userGeoHash6.Substring(0, 3) == stop.GeoHash6.Substring(0, 3);
-				
-				// If not matched, try all neighboring geohashes
-				if (!isNearbyByGeohash)
-				{
-					foreach (var neighbor in neighbors)
-					{
-						if (neighbor.Length >= 3 && stop.GeoHash6.Length >= 3 && 
-							neighbor.Substring(0, 3) == stop.GeoHash6.Substring(0, 3))
-						{
-							isNearbyByGeohash = true;
-							break;
-						}
-					}
-				}
-			}
-			
-			if (isNearbyByGeohash)
-			{
-				// Calculate actual distance to verify proximity
-				var stopLocation = new Location(stop.Latitude, stop.Longitude);
-				double distanceInMeters = Location.CalculateDistance(
-					new Location(_userLocation.Latitude, _userLocation.Longitude), 
-					stopLocation, DistanceUnits.Kilometers) * 1000;
-				
-				// Use a slightly larger radius (1km) for filtering candidates
-				if (distanceInMeters <= 1000)
-				{
-					potentialNearbyStops.Add(stop);
-					foundStopIds.Add(stop.Id);
-					_logger?.LogDebug("Geohash match: Found stop {stopName} at {distance}m", stop.LocalizedName, distanceInMeters.ToString("F1"));
-				}
+				potentialNearbyStops.Add(stop);
+				// foundStopIds.Add(stop.Id); // Not strictly needed if allStops is already pre-filtered
+				_logger?.LogDebug("Found potential stop {stopName} at {distance}m from pre-filtered GeoHash6 list", stop.LocalizedName, distanceInMeters.ToString("F1"));
 			}
 		}
+
+		// The fallback to iterate `allStops` again if `potentialNearbyStops.Count < 5` might be less critical now,
+        // or could be removed if confident in the GeoHash6 + neighbors approach delivering enough candidates.
+        // For now, let's keep it but it will operate on the *same pre-filtered* `allStops` list, making it redundant here.
+        // Let's remove the fallback that iterates over the full `allStops` again since `allStops` is now pre-filtered by GeoHash.
+		/*
+		if (potentialNearbyStops.Count < 5)
+		{
+			_logger?.LogInformation("Found only {0} stops via initial GeoHash6 list processing - this count might be low, check GeoHash logic or stop data.", potentialNearbyStops.Count);
+			// The following block would iterate the same `allStops` list again, which is redundant.
+			// If more stops are needed, the primary GeoHash query or the 1200m radius would need adjustment.
+		}
+		*/
+		
+		_logger?.LogDebug("UpdateNearbyStops: Found {0} potential nearby stops after distance filtering the GeoHash6 list", potentialNearbyStops.Count);
 		
 		// If we don't have enough potential nearby stops, use direct distance calculation for all stops
 		// This ensures we capture stops that might be missed by geohash matching
 		if (potentialNearbyStops.Count < 5)
 		{
-			_logger?.LogInformation("Found only {0} stops via geohash - using direct distance calculation for all stops", potentialNearbyStops.Count);
+			_logger?.LogInformation("Found only {0} stops via initial GeoHash6 list processing - this count might be low, check GeoHash logic or stop data.", potentialNearbyStops.Count);
 			
 			// This is computationally expensive but necessary as a last resort
 			foreach (var stop in allStops)
@@ -2060,39 +2044,14 @@ public partial class MainPage : ContentPage
 		// This avoids issues with the geohash library's specific implementation
 		try 
 		{
-			// Get the first 5 characters of the geohash to find neighbors at a reasonable precision
-			string prefix = centerGeohash.Length >= 5 ? centerGeohash.Substring(0, 5) : centerGeohash;
+			// Get 8 neighbors
+			var neighbors = NGeoHash.GeoHash.Neighbors(centerGeohash);
+			// Add the center geohash itself
+			var allRelevantGeohashes = new List<string>(neighbors);
+			allRelevantGeohashes.Add(centerGeohash);
 			
-			// Create a list of geohash prefixes to check
-			// This is a simple approach but effective for finding nearby areas
-			var neighbors = new List<string> { prefix };
-			
-			// Add slight variations to the prefix
-			// This works because geohashes with similar prefixes are generally close to each other
-			if (prefix.Length >= 3) 
-			{
-				// Get parent geohash (one level up, lower precision)
-				string parentPrefix = prefix.Substring(0, prefix.Length - 1);
-				
-				// Add the parent and some variants
-				neighbors.Add(parentPrefix);
-				
-				// Add some variations on the last character to catch nearby areas
-				char lastChar = prefix[prefix.Length - 1];
-				
-				// Check nearby characters in the base32 alphabet used by geohash
-				string geohashChars = "0123456789bcdefghjkmnpqrstuvwxyz";
-				int idx = geohashChars.IndexOf(lastChar);
-				
-				if (idx > 0)
-					neighbors.Add(parentPrefix + geohashChars[idx - 1]);
-					
-				if (idx < geohashChars.Length - 1)
-					neighbors.Add(parentPrefix + geohashChars[idx + 1]);
-			}
-			
-			_logger?.LogDebug("Using simplified neighbor geohashes: {0}", string.Join(", ", neighbors));
-			return neighbors.ToArray();
+			_logger?.LogDebug("Using NGeoHash.Neighbors for geohashes: {0}", string.Join(", ", allRelevantGeohashes));
+			return allRelevantGeohashes.ToArray();
 		}
 		catch (Exception ex)
 		{
@@ -2445,10 +2404,15 @@ public partial class MainPage : ContentPage
 						for (int i = 0; i < Math.Min(initialBatchSize, stopGroups.Count); i++)
 						{
 							// Only add stop groups that have at least one route with a valid ETA
-							if (stopGroups[i].HasAnyVisibleRoutesWithEta)
-							{
-								filteredItems.Add(stopGroups[i]);
-							}
+							// if (stopGroups[i].HasAnyVisibleRoutesWithEta)
+							// {
+							//	filteredItems.Add(stopGroups[i]);
+							// }
+                            // Always add the stop group if it exists; ETAs will populate it.
+                            if (stopGroups[i] != null && stopGroups[i].Routes.Any())
+                            {
+                                filteredItems.Add(stopGroups[i]);
+                            }
 						}
 						filteredItems.EndBatch();
 					});
@@ -2469,12 +2433,16 @@ public partial class MainPage : ContentPage
 							await Task.WhenAll(batchTasks);
 							
 							// Update UI with this batch
-							var validGroups = batch.Where(sg => sg.HasAnyVisibleRoutesWithEta).ToList();
-							if (validGroups.Any())
-							{
+							// var validGroups = batch.Where(sg => sg.HasAnyVisibleRoutesWithEta).ToList();
+							// if (validGroups.Any())
+							// {
+                            // Always add groups that have routes.
+                            var groupsToAdd = batch.Where(sg => sg != null && sg.Routes.Any()).ToList();
+                            if (groupsToAdd.Any())
+                            {
 								await MainThread.InvokeOnMainThreadAsync(() => {
 									filteredItems.BeginBatch();
-									foreach (var group in validGroups)
+									foreach (var group in groupsToAdd) // Changed from validGroups
 									{
 										filteredItems.Add(group);
 									}
@@ -2638,7 +2606,7 @@ public partial class MainPage : ContentPage
 							route.FirstEta = etas.OrderBy(e => e.EtaTime).FirstOrDefault()?.DisplayEta ?? string.Empty;
 							
 							// Also update the StopGroup's ETAs collection
-							stopGroup.UpdateEtas(route.RouteNumber, route.ServiceType, etas);
+							stopGroup.UpdateEtas(route.RouteNumber, route.ServiceType, route.Bound, etas);
 							
 							routesUpdated++;
 						}
@@ -3254,12 +3222,12 @@ public partial class MainPage : ContentPage
 									// Update the route's FirstEta property with the first (earliest) ETA
 									update.Item1.FirstEta = update.Item2?.DisplayEta ?? string.Empty;
 									
-									// Also update the StopGroup's ETAs collection
-									stopGroup.UpdateEtas(update.Item1.RouteNumber, update.Item1.ServiceType, update.Item3);
+									// Also update the StopGroup's ETAs collection, now including Bound
+									stopGroup.UpdateEtas(update.Item1.RouteNumber, update.Item1.ServiceType, update.Item1.Bound, update.Item3);
 								}
 								
 								_logger?.LogDebug("Updated ETAs for {updated}/{total} routes at stop {stopId}", 
-									updates.Count, stopGroup.Routes.Count, stopGroup.Stop.StopId);
+										updates.Count, stopGroup.Routes.Count, stopGroup.Stop.StopId);
 									
 								// Force UI refresh for the stop group
 								stopGroup.NotifyPropertyChanged(nameof(StopGroup.Routes));
