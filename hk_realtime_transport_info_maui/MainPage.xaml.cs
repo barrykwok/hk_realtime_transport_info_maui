@@ -1521,7 +1521,7 @@ public partial class MainPage : ContentPage
 					{
 						try 
 						{
-							var routes = _databaseService.GetRoutesWithoutStops();
+							var routes = _databaseService.GetAllRecords<TransportRoute>("TransportRoutes");
 							if (routes != null)
 							{
 								allRoutes = routes.ToList();

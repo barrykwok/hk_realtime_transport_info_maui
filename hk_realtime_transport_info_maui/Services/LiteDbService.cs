@@ -432,18 +432,35 @@ namespace hk_realtime_transport_info_maui.Services
             var db = GetDatabase();
             var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
             var relationCollection = db.GetCollection<RouteStopRelation>("RouteStopRelations");
+
+            var allRoutes = routeCollection.FindAll().ToList();
+            if (!allRoutes.Any())
+            {
+                _logger?.LogDebug("GetRoutesWithoutStops: No routes found in TransportRoutes collection.");
+                return Enumerable.Empty<TransportRoute>();
+            }
+
+            // Get all unique RouteIds from RouteStopRelations.
+            // This should be more efficient than FindAll().Select().Distinct() if an index on RouteId is used by LiteDB's Query().Select().
+            _logger?.LogDebug("GetRoutesWithoutStops: Fetching distinct RouteIds from RouteStopRelations.");
+            var routeIdsWithStops = new HashSet<string>(
+                relationCollection.Query()
+                                  .Select(x => x.RouteId) // Query only the RouteId field
+                                  .ToEnumerable()        // Execute the query
+                                  .Distinct()            // Get distinct IDs
+            );
+            _logger?.LogDebug("GetRoutesWithoutStops: Found {Count} distinct RouteIds in RouteStopRelations.", routeIdsWithStops.Count);
+
+            if (!routeIdsWithStops.Any())
+            {
+                _logger?.LogDebug("GetRoutesWithoutStops: No route IDs found in RouteStopRelations. Returning all {Count} routes.", allRoutes.Count);
+                return allRoutes; // No relations means all routes are "without stops" in this context
+            }
+
+            var routesWithoutStopsResult = allRoutes.Where(r => !routeIdsWithStops.Contains(r.Id)).ToList();
+            _logger?.LogDebug("GetRoutesWithoutStops: Filtered down to {Count} routes without stops.", routesWithoutStopsResult.Count);
             
-            // Find all route IDs that have stop relations
-            var routeIdsWithStops = relationCollection
-                .FindAll()
-                .Select(r => r.RouteId)
-                .Distinct()
-                .ToList();
-            
-            // Find routes that don't have any stop relations
-            return routeCollection
-                .Find(r => !routeIdsWithStops.Contains(r.Id))
-                .ToList();
+            return routesWithoutStopsResult;
         }
         
         public T GetRecordById<T>(string collectionName, string id) where T : class, new()
