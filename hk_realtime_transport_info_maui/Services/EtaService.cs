@@ -93,7 +93,7 @@ namespace hk_realtime_transport_info_maui.Services
         private async Task ApplyRateLimiting()
         {
             DateTime now = DateTime.UtcNow;
-            // int delayMs = 0; // Original calculation removed to disable delay from this method
+            // int delayMs = 0; // Original calculation removed to disable delay from this method's new logic
             
             lock (_lastRequestLock)
             {
@@ -771,43 +771,53 @@ namespace hk_realtime_transport_info_maui.Services
                     
                     if (!response.IsSuccessStatusCode)
                     {
-                        _logger?.LogWarning("[EtaService] KMB ETA API returned status code {statusCode} for stop {kmbStopId} (URL: {apiUrl})", 
-                            response.StatusCode, originalStopIdForLogging, url);
+                        // Log the initial failure
+                        _logger?.LogWarning("[EtaService] KMB ETA API call for stop {kmbStopId} failed. Status: {statusCode}, URL: {apiUrl}",
+                            originalStopIdForLogging, response.StatusCode, url);
 
-                        // DRASTIC DEBUGGING FOR 422 RETRY:
-                        if (response.StatusCode == HttpStatusCode.UnprocessableEntity && retryCount < 2)
+                        if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
                         {
-                            retryCount++;
-                            _logger?.LogWarning("[EtaService] DRASTIC DEBUG: RETRYING KMB ETA API call for stop {kmbStopId} due to 422. Attempt {retryAttempt}/2. (URL: {apiUrl}) NO DELAY THIS TIME", 
-                                originalStopIdForLogging, retryCount, url);
-                            continue; // Explicitly try to force a loop continuation for 422
+                            // For 422, typically means bad request (e.g. invalid stopId).
+                            // Attempt one immediate retry, just in case of a very transient issue.
+                            if (retryCount < 1) // Max 1 retry for 422 (total 2 attempts)
+                            {
+                                retryCount++;
+                                _logger?.LogInformation("[EtaService] UnprocessableEntity (422) for stop {kmbStopId}. Attempting 1 quick retry ({retryAttempt}/1). URL: {apiUrl}",
+                                    originalStopIdForLogging, retryCount, url);
+                                // Optional: await Task.Delay(200); // Very short delay if desired
+                                continue;
+                            }
+                            _logger?.LogWarning("[EtaService] Persistent UnprocessableEntity (422) for stop {kmbStopId} after {retries} attempts. Giving up. URL: {apiUrl}",
+                                originalStopIdForLogging, retryCount + 1, url);
+                            // Cache empty result effectively happens when we return new List<TransportEta>() 
+                            // and the caller (e.g., GetCachedEtas) caches it.
+                            return new List<TransportEta>();
                         }
-                        
-                        // Original broader retry logic (now might be partially redundant for 422 if above hits first)
-                        bool shouldRetry = false;
-                        if ((int)response.StatusCode >= 500) { // Server errors
-                            shouldRetry = true;
-                        }
-                        // else if (response.StatusCode == HttpStatusCode.UnprocessableEntity) { // Handled above for debugging
-                        //    shouldRetry = true;
-                        // }
-
-                        if (retryCount < 2 && shouldRetry) // This will now primarily handle 5xx errors
+                        else if ((int)response.StatusCode >= 500 && (int)response.StatusCode < 600) // Server-side errors (5xx)
                         {
-                            retryCount++;
-                            _logger?.LogWarning("[EtaService] RETRYING KMB ETA API call for stop {kmbStopId} due to {statusCode}. Attempt {retryAttempt}/{maxAttempts}. (URL: {apiUrl})", 
-                                originalStopIdForLogging, response.StatusCode, retryCount, 2, url);
-                                
-                            int delayMs = retryCount * RetryDelayMilliseconds;
-                            await Task.Delay(delayMs);
-                            continue;
+                            const int maxServerRetries = 2;
+                            if (retryCount < maxServerRetries) 
+                            {
+                                retryCount++;
+                                _logger?.LogInformation("[EtaService] Server error {statusCode} for stop {kmbStopId}. Retrying (Attempt {retryAttempt}/{maxRetries}). URL: {apiUrl}",
+                                    response.StatusCode, originalStopIdForLogging, retryCount, maxServerRetries, url);
+                                await Task.Delay(retryCount * RetryDelayMilliseconds); // Standard delay
+                                continue;
+                            }
+                            _logger?.LogError("[EtaService] Persistent server error {statusCode} for stop {kmbStopId} after {retries} attempts. Giving up. URL: {apiUrl}",
+                                response.StatusCode, originalStopIdForLogging, retryCount + 1, url);
+                            return new List<TransportEta>();
                         }
-                        
-                        return new List<TransportEta>(); // If not retrying, return empty list
+                        else // Other client errors (4xx, excluding 422 handled above) or unexpected status codes
+                        {
+                            _logger?.LogWarning("[EtaService] Client error {statusCode} (non-422/5xx) for stop {kmbStopId}. Not retrying. URL: {apiUrl}",
+                                response.StatusCode, originalStopIdForLogging, url);
+                            return new List<TransportEta>();
+                        }
                     }
                     
-                    // If successful, reset retryCount for this stopId's session in the while loop (though typically we'd return)
-                    // retryCount = 0; // This might be useful if the loop could continue for other reasons post-success
+                    // If successful, reset retryCount (though typically we return shortly after success)
+                    // retryCount = 0; 
 
                     // Read the response as JSON
                     var responseData = await response.Content.ReadAsStreamAsync();
