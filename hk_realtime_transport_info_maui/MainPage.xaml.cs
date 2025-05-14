@@ -1108,8 +1108,19 @@ public partial class MainPage : ContentPage
 				// Ensure we're still connected to the app
 				await MainThread.InvokeOnMainThreadAsync(async () => 
 				{
-					_logger?.LogInformation("Updating ETAs for current view");
-					await UpdateEtasForCurrentView();
+					_logger?.LogInformation("OnDataReady: Triggering ETA update for current view if applicable.");
+					// Only update ETAs if we are in a nearby view and Routes has items
+					if (_currentDistanceFilter != DistanceFilter.All && Routes != null && Routes.Any())
+					{
+						_logger?.LogInformation("OnDataReady: Current view has {count} items, proceeding with ETA update.", Routes.Count);
+						var currentDisplayItems = new ObservableRangeCollection<object>(Routes.ToList()); // Pass a copy
+						await UpdateEtasForCurrentView(currentDisplayItems);
+					}
+					else
+					{
+						_logger?.LogInformation("OnDataReady: Skipping ETA update. Filter is ALL or Routes is empty. Current Filter: {filter}, Routes Count: {count}", 
+							_currentDistanceFilter, Routes?.Count ?? 0);
+					}
 				});
 			}
 			catch (Exception ex)
@@ -1721,33 +1732,37 @@ public partial class MainPage : ContentPage
 							await MainThread.InvokeOnMainThreadAsync(async () => {
 								_userLocation = location;
 								_lastLocationUpdate = DateTime.Now;
-								
-								// Clear cache when location changes
 								_stopGroupsCache.Clear();
 								
 								// After getting new location, update nearby stops
-								await UpdateNearbyStops();
-								
-								// Apply the current distance filter with loading indicator
-								IsRefreshing = true;
-								
-								try
+								// This will also handle the current distance filter.
+								if (_currentDistanceFilter != DistanceFilter.All)
 								{
-									await ApplyDistanceFilterAsync(_currentDistanceFilter, _currentDistanceFilter);
+									_logger?.LogInformation("New location obtained. Nearby filter '{filter}' is active. Calling UpdateNearbyStops().", _currentDistanceFilter);
+									IsRefreshing = true;
+									try
+									{
+										await UpdateNearbyStops();
+									}
+									finally
+									{
+										IsRefreshing = false;
+									}
 								}
-								finally
+								else
 								{
-									IsRefreshing = false;
+									 _logger?.LogInformation("New location obtained. Filter is ALL. OnAppearing or OnDistanceFilterClicked will handle list population.");
 								}
 							});
 						}
 						else
 						{
-							await MainThread.InvokeOnMainThreadAsync(() => {
+							await MainThread.InvokeOnMainThreadAsync(async () => {
 								_logger?.LogWarning("Could not get location, defaulting to ALL filter");
 								_currentDistanceFilter = DistanceFilter.All;
-								UpdateDistanceFilterButtonColors();
-								FilterRoutes();
+								 UpdateDistanceFilterButtonColors();
+								// FilterRoutes(); // Replaced by LoadAllRoutesWithVirtualization for consistency
+								await LoadAllRoutesWithVirtualization();
 							});
 						}
 					}
@@ -1756,13 +1771,35 @@ public partial class MainPage : ContentPage
 						_logger?.LogError(ex, "Error getting user location in background task");
 						
 						// On error, default to ALL filter
-						await MainThread.InvokeOnMainThreadAsync(() => {
+						await MainThread.InvokeOnMainThreadAsync(async () => {
 							_currentDistanceFilter = DistanceFilter.All;
-							UpdateDistanceFilterButtonColors();
-							FilterRoutes();
+							 UpdateDistanceFilterButtonColors();
+							// FilterRoutes(); // Replaced by LoadAllRoutesWithVirtualization for consistency
+							await LoadAllRoutesWithVirtualization();
 						});
 					}
 				});
+			}
+			else // Location is considered fresh
+			{
+				if (_currentDistanceFilter != DistanceFilter.All && _userLocation != null)
+				{
+					_logger?.LogInformation("Location is fresh. Current nearby filter is {filter}. Triggering UpdateNearbyStops.", _currentDistanceFilter);
+					// Ensure IsRefreshing is managed on the UI thread
+					await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = true);
+					try
+					{
+						await UpdateNearbyStops(); // This will use the fresh _userLocation and current _currentDistanceFilter
+					}
+					finally
+					{
+						await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
+					}
+				}
+				else if (_currentDistanceFilter == DistanceFilter.All)
+				{
+					_logger?.LogDebug("Location is fresh. Current filter is ALL. No direct stop update needed from this path as OnDistanceFilterClicked or OnAppearing handles it.");
+				}
 			}
 		}
 		catch (Exception ex)
@@ -1999,37 +2036,27 @@ public partial class MainPage : ContentPage
 		if (_stopsNearby.Count > 0 && _currentDistanceFilter != DistanceFilter.All)
 		{
 			// Create a preliminary UI update with stops but without ETAs
-			await MainThread.InvokeOnMainThreadAsync(async () => {
-				try
-				{
-					// Show available stops immediately without waiting for ETAs
-					// This gives immediate feedback to the user
-					await ApplyDistanceFilterWithoutEtasAsync(_currentDistanceFilter);
-					
-					_logger?.LogInformation("Displayed initial stops list without ETAs");
-				}
-				catch (Exception ex)
-				{
-					_logger?.LogError(ex, "Error showing preliminary UI");
-				}
-			});
+			// This call now returns the collection instead of updating this.Routes
+			var initialStopGroupsToDisplay = await ApplyDistanceFilterWithoutEtasAsync(_currentDistanceFilter);
+			_logger?.LogInformation("Prepared {count} initial stop groups (without ETAs) for filter {filter}", initialStopGroupsToDisplay.Count, _currentDistanceFilter);
 			
 			// Now fetch ETAs in the background AFTER showing the UI
 			_ = Task.Run(async () => {
 				try
 				{
-					// Delay slightly to let UI render completely
+					// Delay slightly to let UI render completely (if it were to render here, but it won't yet)
 					await Task.Delay(100);
 					
 					// If we're showing a nearby view, now fetch ETAs for the displayed stops
+					// Pass the initialStopGroupsToDisplay to UpdateEtasForCurrentView
 					if (_currentDistanceFilter != DistanceFilter.All)
 					{
-						await UpdateEtasForCurrentView();
+						await UpdateEtasForCurrentView(initialStopGroupsToDisplay);
 					}
 				}
 				catch (Exception ex)
 				{
-					_logger?.LogError(ex, "Error updating ETAs after showing stops: {message}", ex.Message);
+					_logger?.LogError(ex, "Error updating ETAs after preparing stops: {message}", ex.Message);
 				}
 			});
 		}
@@ -2183,23 +2210,9 @@ public partial class MainPage : ContentPage
 						{
 							if (isNearbyFilter)
 							{
-								// Handle nearby filter
-								var nearbyResult = await ApplyDistanceFilterAsync(previousFilter, _currentDistanceFilter);
-								await MainThread.InvokeOnMainThreadAsync(() => 
-								{
-									Routes = nearbyResult;
-									
-									// Force the collection view to update with the new data
-									var nearbyCollection = this.FindByName<CollectionView>("RoutesCollection");
-									if (nearbyCollection != null)
-									{
-										nearbyCollection.ItemsSource = null;
-										nearbyCollection.ItemsSource = nearbyResult;
-										
-										_logger?.LogInformation("Explicitly updated UI with {0} items for {1} filter", 
-											nearbyResult.Count, _currentDistanceFilter);
-									}
-								});
+								// This will ensure location is fresh if needed, then call UpdateNearbyStops with the new _currentDistanceFilter.
+								// UpdateNearbyStops will then trigger the new data pipeline (ApplyDistanceFilterWithoutEtasAsync -> UpdateEtasForCurrentView).
+								await UpdateUserLocationIfNeeded();
 							}
 							else
 							{
@@ -2789,7 +2802,7 @@ public partial class MainPage : ContentPage
 									{
 										foreach (var stopGroup in cachedStopGroups)
 										{
-											ApplyEtasToStopGroup(stopGroup, cachedEtas);
+											await ApplyEtasToStopGroupAsync(stopGroup, cachedEtas);
 										}
 									}
 									
@@ -2813,7 +2826,7 @@ public partial class MainPage : ContentPage
 								{
 									foreach (var stopGroup in relatedStopGroups)
 									{
-										ApplyEtasToStopGroup(stopGroup, allEtas);
+										await ApplyEtasToStopGroupAsync(stopGroup, allEtas);
 									}
 								}
 							}
@@ -2839,6 +2852,8 @@ public partial class MainPage : ContentPage
 				}
 				
 				_logger?.LogInformation("Completed ETA updates for all expanded stop groups");
+				// Call cleanup after processing all ETAs for expanded groups
+				await CleanupEmptyStopGroupsFromViewAsync(); 
 			}
 			finally
 			{
@@ -3118,7 +3133,7 @@ public partial class MainPage : ContentPage
 								{
 									foreach (var stopGroup in cachedStopGroups)
 									{
-										ApplyEtasToStopGroup(stopGroup, cachedEtas);
+										await ApplyEtasToStopGroupAsync(stopGroup, cachedEtas);
 									}
 								}
 								
@@ -3134,7 +3149,7 @@ public partial class MainPage : ContentPage
 							{
 								foreach (var stopGroup in relatedStopGroups)
 								{
-									ApplyEtasToStopGroup(stopGroup, allEtas);
+									await ApplyEtasToStopGroupAsync(stopGroup, allEtas);
 								}
 							}
 						}
@@ -3176,79 +3191,105 @@ public partial class MainPage : ContentPage
 	}
 
 	// Helper method to apply ETAs to a stop group
-	private void ApplyEtasToStopGroup(StopGroup stopGroup, List<TransportEta> allEtas)
+	private async Task<bool> ApplyEtasToStopGroupAsync(StopGroup stopGroup, List<TransportEta> allEtasFromApi)
 	{
 		try
 		{
-			if (allEtas == null || allEtas.Count == 0)
+			bool anyRouteGotEta = false;
+			if (allEtasFromApi == null) 
 			{
-				return;
+				_logger?.LogWarning($"ApplyEtasToStopGroupAsync: allEtasFromApi is null for StopGroup {stopGroup.Stop.StopId}. Clearing ETAs on routes.", stopGroup.Stop.StopId);
+				await MainThread.InvokeOnMainThreadAsync(() =>
+				{
+					foreach (var route in stopGroup.Routes)
+					{
+						route.FirstEta = string.Empty;
+						route.NextEta = null;
+						route.Etas = new List<TransportEta>();
+						// Do not call stopGroup.UpdateEtas or NotifyPropertyChanged here
+					}
+				});
+				return false; 
 			}
-			
-			// Do expensive grouping, filtering and sorting work OUTSIDE the UI thread
-			// Use Task.Run to move the expensive processing off the UI thread
-			Task.Run(() => 
+
+			var updates = new List<Tuple<TransportRoute, TransportEta?, List<TransportEta>>>();
+			bool apiReturnedDataForThisStop = allEtasFromApi.Count > 0;
+
+			if (apiReturnedDataForThisStop)
+			{
+				var etasByRouteKey = allEtasFromApi
+					.GroupBy(e => new { e.RouteNumber, e.ServiceType, e.Direction }) 
+					.ToDictionary(g => g.Key, g => g.ToList());
+
+				foreach (var route in stopGroup.Routes) // Iterate original routes
+				{
+					var key = new { route.RouteNumber, route.ServiceType, Direction = route.Bound };
+					if (etasByRouteKey.TryGetValue(key, out var etasForRoute) && etasForRoute.Any())
+					{
+						var firstEta = etasForRoute.OrderBy(e => e.EtaTime).FirstOrDefault();
+						updates.Add(Tuple.Create(route, firstEta, etasForRoute));
+					}
+					else
+					{
+						updates.Add(Tuple.Create(route, (TransportEta?)null, new List<TransportEta>()));
+					}
+				}
+			}
+			else 
+			{
+				_logger?.LogDebug($"ApplyEtasToStopGroupAsync: API returned 0 ETAs for stop {stopGroup.Stop.StopId}. Marking all routes in group as having no ETA.");
+				foreach (var route in stopGroup.Routes)
+				{
+					updates.Add(Tuple.Create(route, (TransportEta?)null, new List<TransportEta>()));
+				}
+			}
+
+			await MainThread.InvokeOnMainThreadAsync(() =>
 			{
 				try
 				{
-					// Group ETAs by route number and service type
-					var etasByRoute = allEtas.GroupBy(e => new { RouteNumber = e.RouteNumber, ServiceType = e.ServiceType })
-						.ToDictionary(g => g.Key, g => g.ToList());
-					
-					var updates = new List<Tuple<TransportRoute, TransportEta, List<TransportEta>>>();
-					
-					// Prepare all route updates outside the UI thread
-					foreach (var route in stopGroup.Routes)
+					foreach (var update in updates)
 					{
-						var key = new { RouteNumber = route.RouteNumber, ServiceType = route.ServiceType };
-						if (etasByRoute.TryGetValue(key, out var etas) && etas.Count > 0)
+						var routeToUpdate = update.Item1;
+						routeToUpdate.FirstEta = update.Item2?.DisplayEta ?? string.Empty;
+						routeToUpdate.NextEta = update.Item2;
+						routeToUpdate.Etas = update.Item3 ?? new List<TransportEta>();
+						
+						if (routeToUpdate.HasEta) // Check if this route got an ETA
 						{
-							// Find the earliest ETA - do this sorting outside UI thread
-							var firstEta = etas.OrderBy(e => e.EtaTime).FirstOrDefault();
-							updates.Add(new Tuple<TransportRoute, TransportEta, List<TransportEta>>(route, firstEta, etas));
+							anyRouteGotEta = true;
 						}
-					}
-					
-					// Now that we have the updates prepared, invoke the UI update
-					if (updates.Count > 0)
-					{
-						MainThread.BeginInvokeOnMainThread(() =>
-						{
-							try
-							{
-								// Apply all updates at once on the UI thread
-								foreach (var update in updates)
-								{
-									// Update the route's FirstEta property with the first (earliest) ETA
-									update.Item1.FirstEta = update.Item2?.DisplayEta ?? string.Empty;
-									
-									// Also update the StopGroup's ETAs collection, now including Bound
-									stopGroup.UpdateEtas(update.Item1.RouteNumber, update.Item1.ServiceType, update.Item1.Bound, update.Item3);
-								}
-								
-								_logger?.LogDebug("Updated ETAs for {updated}/{total} routes at stop {stopId}", 
-										updates.Count, stopGroup.Routes.Count, stopGroup.Stop.StopId);
-									
-								// Force UI refresh for the stop group
-								stopGroup.NotifyPropertyChanged(nameof(StopGroup.Routes));
-							}
-							catch (Exception ex)
-							{
-								_logger?.LogError(ex, "Error updating ETAs on main thread");
-							}
-						});
+						// Do NOT modify stopGroup.Routes collection here
+						// Do NOT call stopGroup.UpdateEtas or NotifyPropertyChanged for stopGroup here
 					}
 				}
 				catch (Exception ex)
 				{
-					_logger?.LogError(ex, "Error processing ETAs outside UI thread: {message}", ex.Message);
+					_logger?.LogError(ex, $"Error during MainThread update of route properties in ApplyEtasToStopGroupAsync for StopGroup {stopGroup.Stop.StopId}");
+					anyRouteGotEta = false; 
 				}
 			});
+			
+			_logger?.LogDebug($"ApplyEtasToStopGroupAsync for StopGroup '{stopGroup.Stop.LocalizedName}' (ID: {stopGroup.Stop.StopId}): Processed ETAs for its routes. anyRouteGotEta: {anyRouteGotEta}");
+			return anyRouteGotEta;
 		}
 		catch (Exception ex)
 		{
-			_logger?.LogError(ex, "Error applying ETAs to stop group for stop {stopName}", 
-				stopGroup.Stop?.LocalizedName ?? "unknown");
+			_logger?.LogError(ex, $"Outer error in ApplyEtasToStopGroupAsync for stop {stopGroup.Stop?.LocalizedName ?? "unknown"} (ID: {stopGroup.Stop?.StopId ?? "unknown"})");
+			await MainThread.InvokeOnMainThreadAsync(() => {
+				try {
+					if (stopGroup?.Routes != null) {
+						foreach (var route in stopGroup.Routes) {
+							route.FirstEta = string.Empty;
+							route.NextEta = null;
+							route.Etas = new List<TransportEta>();
+						}
+					}
+				} catch (Exception iex) {
+					_logger?.LogError(iex, "Failed to clear ETAs on routes in outer catch block of ApplyEtasToStopGroupAsync.");
+				}
+			});
+			return false; 
 		}
 	}
 
@@ -3265,7 +3306,7 @@ public partial class MainPage : ContentPage
 			{
 				_logger?.LogDebug("Using cached ETAs for stop: {stopId}", stopGroup.Stop.StopId);
 				var cachedEtas = await _etaService.GetCachedEtas(stopGroup.Stop.StopId);
-				ApplyEtasToStopGroup(stopGroup, cachedEtas);
+				await ApplyEtasToStopGroupAsync(stopGroup, cachedEtas);
 				return;
 			}
 				
@@ -3317,7 +3358,7 @@ public partial class MainPage : ContentPage
 			}
 			
 			// Apply the filtered ETAs to the stop group
-			ApplyEtasToStopGroup(stopGroup, filteredEtas);
+			await ApplyEtasToStopGroupAsync(stopGroup, filteredEtas);
 		}
 		catch (Exception ex)
 		{
@@ -3326,110 +3367,202 @@ public partial class MainPage : ContentPage
 	}
 
 	// Call this method after loading route data
-	private async Task UpdateEtasForCurrentView()
+	private async Task UpdateEtasForCurrentView(ObservableRangeCollection<object> stopGroupsToProcessFromCaller)
 	{
 		try
 		{
-			// Ensure we're not already updating ETAs
 			if (_isUpdatingEtas)
 			{
 				_logger?.LogDebug("Skipping ETA update as one is already in progress");
 				return;
 			}
 			
-			// Use a lock to avoid concurrent update attempts
 			lock (_etaLock)
 			{
 				if (_isUpdatingEtas) return;
 				_isUpdatingEtas = true;
 			}
 			
+			List<StopGroup> originalStopGroups = stopGroupsToProcessFromCaller.OfType<StopGroup>().ToList();
+			Dictionary<string, bool> groupActivityStatus = new Dictionary<string, bool>(); // StopId to isActive
+
 			try
 			{
-				// Get the visible stop groups
-				var stopGroups = Routes.OfType<StopGroup>().ToList();
-				if (stopGroups.Count == 0)
+				if (originalStopGroups.Count == 0)
 				{
-					_logger?.LogDebug("No stop groups found to update ETAs");
+					_logger?.LogDebug("No stop groups passed to UpdateEtasForCurrentView to update ETAs for.");
+					lock (_etaLock) { _isUpdatingEtas = false; } 
+					await MainThread.InvokeOnMainThreadAsync(() => 
+					{
+						this.Routes = new ObservableRangeCollection<object>();
+						var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+						if (collectionView != null) 
+						{
+							collectionView.ItemsSource = null;
+							collectionView.ItemsSource = this.Routes;
+						}
+					});
 					return;
 				}
 				
-				_logger?.LogInformation("Updating ETAs for {count} stop groups", stopGroups.Count);
+				_logger?.LogInformation("UpdateEtasForCurrentView processing {count} stop groups passed from caller.", originalStopGroups.Count);
 				
-				// Create a list of stop IDs to batch process
-				var stopIds = stopGroups.Select(sg => sg.Stop.Id).Distinct().ToList();
-				
-				// Process in small batches to avoid overwhelming the API
-				const int batchSize = 2; // Smaller batch size to minimize rate limiting
+				var stopIds = originalStopGroups.Select(sg => sg.Stop.Id).Distinct().ToList();
+				const int batchSize = 2; // Reduced batch size for more responsive ETA updates
 				
 				for (int i = 0; i < stopIds.Count; i += batchSize)
 				{
-					// Get the current batch
 					var batchStopIds = stopIds.Skip(i).Take(batchSize).ToList();
-					
-					// Create a list of tasks for this batch
 					var batchTasks = new List<Task>();
 					
 					foreach (var stopId in batchStopIds)
 					{
-						// Use the new optimized method instead of the old one
 						batchTasks.Add(Task.Run(async () => 
 						{
 							try
 							{
-								// Use optimized ETA fetching that handles caching internally
 								var etas = await _etaService.FetchAllKmbEtaForStopOptimized(stopId);
+								var relatedOriginalGroups = originalStopGroups.Where(sg => sg.Stop.Id == stopId).ToList();
 								
-								// Get all stop groups for this stop ID
-								var relatedGroups = stopGroups.Where(sg => sg.Stop.Id == stopId).ToList();
-								
-								// Apply ETAs to all related stop groups
-								foreach (var group in relatedGroups)
+								foreach (var group in relatedOriginalGroups)
 								{
-									ApplyEtasToStopGroup(group, etas);
+									bool isActive = await ApplyEtasToStopGroupAsync(group, etas);
+									groupActivityStatus[group.Stop.Id] = groupActivityStatus.ContainsKey(group.Stop.Id) ? groupActivityStatus[group.Stop.Id] || isActive : isActive;
 								}
 							}
 							catch (Exception ex)
 							{
-								_logger?.LogError(ex, "Error fetching ETAs for stop {stopId}", stopId);
+								_logger?.LogError(ex, "Error fetching/applying ETAs for stop {stopId} in batch.", stopId);
+								// If error, mark related groups as inactive for safety
+								var erroredGroups = originalStopGroups.Where(sg => sg.Stop.Id == stopId);
+								foreach(var eg in erroredGroups) groupActivityStatus[eg.Stop.Id] = false;
 							}
 						}));
 					}
 					
-					// Wait for all tasks in this batch to complete
 					await Task.WhenAll(batchTasks);
 					
-					// Add a small delay between batches for rate limiting
 					if (i + batchSize < stopIds.Count)
 					{
-						await Task.Delay(200);
+						await Task.Delay(50); // Shorter delay between batches
 					}
 				}
 				
-				_logger?.LogInformation("Completed ETA updates for all stop groups");
-				
-				// Ensure timer is running for future updates
+				var finalStopGroupsToDisplay = new List<StopGroup>();
+				foreach(var originalGroup in originalStopGroups)
+				{
+					bool isActive = groupActivityStatus.TryGetValue(originalGroup.Stop.Id, out var status) && status;
+					if (isActive)
+					{
+						var routesWithEta = originalGroup.Routes.Where(r => r.HasEta).ToList();
+						if (routesWithEta.Any())
+						{
+							var newUiStopGroup = new StopGroup(originalGroup.Stop, new ObservableRangeCollection<TransportRoute>(routesWithEta), originalGroup.DistanceInMeters);
+							finalStopGroupsToDisplay.Add(newUiStopGroup);
+						}
+					}
+				}
+
+				_logger?.LogInformation("UpdateEtasForCurrentView: After ETA processing, {count} final stop groups constructed with active routes.", finalStopGroupsToDisplay.Count);
+
+				await MainThread.InvokeOnMainThreadAsync(() =>
+				{
+					var newCollection = new ObservableRangeCollection<object>();
+					newCollection.AddRange(finalStopGroupsToDisplay.Cast<object>().OrderBy(sg => ((StopGroup)sg).DistanceInMeters)); // Sort by distance again
+					
+					this.Routes = newCollection;
+
+					var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+					if (collectionView != null)
+					{
+						_logger?.LogInformation("[Main Update] Explicitly setting ItemsSource on RoutesCollection with {count} final items.", newCollection.Count);
+						collectionView.ItemsSource = null;
+						collectionView.ItemsSource = this.Routes;
+					}
+					
+					var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
+					if (noRoutesLabel != null)
+					{
+						if (finalStopGroupsToDisplay.Count == 0 && _currentDistanceFilter != DistanceFilter.All)
+						{
+							noRoutesLabel.Text = $"No active routes found within {_currentDistanceFilter.ToString().Replace("Meters", "")}m of your location.";
+							noRoutesLabel.IsVisible = true;
+						}
+						else
+						{
+							noRoutesLabel.IsVisible = finalStopGroupsToDisplay.Count == 0; 
+						}
+					}
+				});
+
+				_logger?.LogInformation("Completed UpdateEtasForCurrentView. Final UI update scheduled with {count} items.", finalStopGroupsToDisplay.Count);
 				EnsureEtaTimerIsRunning();
 			}
 			finally
 			{
-				// Reset the update flag
 				lock (_etaLock)
 				{
-					_isUpdatingEtas = false;
+					_isUpdatingEtas = false; 
 				}
 			}
 		}
 		catch (Exception ex)
 		{
-			_logger?.LogError(ex, "Error updating ETAs for current view");
-			
-			// Reset the update flag on error
+			_logger?.LogError(ex, "Outer error in UpdateEtasForCurrentView");
 			lock (_etaLock)
 			{
-				_isUpdatingEtas = false;
+				_isUpdatingEtas = false; 
 			}
 		}
+	}
+
+	// New method to cleanup empty stop groups from the UI
+	private async Task CleanupEmptyStopGroupsFromViewAsync()
+	{
+		await MainThread.InvokeOnMainThreadAsync(() =>
+		{
+			if (Routes is ObservableRangeCollection<object> currentRoutesCollection)
+			{
+				_logger?.LogInformation("[MainThread Cleanup] Inspecting StopGroups before removal. Total items in Routes: {TotalCount}", currentRoutesCollection.Count);
+				foreach (var item in currentRoutesCollection)
+				{
+					if (item is StopGroup sg_inspect)
+					{
+						_logger?.LogInformation($"[MainThread Cleanup Inspect] StopGroup ID: {sg_inspect.Stop.StopId}, Name: {sg_inspect.Stop.LocalizedName}, Routes.Count: {sg_inspect.Routes.Count}, HasAnyVisibleRoutesWithEta: {sg_inspect.HasAnyVisibleRoutesWithEta}");
+					}
+				}
+
+				var groupsToRemove = currentRoutesCollection.OfType<StopGroup>()
+												.Where(sg => !sg.HasAnyVisibleRoutesWithEta) // Use the property as intended
+												.ToList();
+				
+				if (groupsToRemove.Any())
+				{
+					_logger?.LogInformation("[MainThread Cleanup] Rebuilding Routes collection to remove {count} StopGroups with no active routes based on HasAnyVisibleRoutesWithEta.", groupsToRemove.Count);
+					var itemsToKeep = currentRoutesCollection.Where(item =>
+						!(item is StopGroup sg && groupsToRemove.Contains(sg))
+					).ToList();
+					
+					// Create a new collection with items to keep and assign it
+					var newCollection = new ObservableRangeCollection<object>();
+					newCollection.AddRange(itemsToKeep); // Efficiently add items
+					Routes = newCollection; // Assign to the property to trigger setter and UI update
+
+					// Explicitly update the CollectionView's ItemsSource
+					var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+					if (collectionView != null)
+					{
+						_logger?.LogInformation("[MainThread Cleanup] Explicitly setting ItemsSource on RoutesCollection after removing empty groups.");
+						collectionView.ItemsSource = null; 
+						collectionView.ItemsSource = Routes; // Set it to the new collection instance
+					}
+				}
+				else
+				{
+					_logger?.LogInformation("[MainThread Cleanup] No StopGroups to remove.");
+				}
+			}
+		});
 	}
 
 	// Add this method immediately after or before FetchEtaForStopGroup method
@@ -4109,7 +4242,7 @@ public partial class MainPage : ContentPage
 	}
 
 	// Add new method for displaying stops without waiting for ETAs
-	private async Task ApplyDistanceFilterWithoutEtasAsync(DistanceFilter filter)
+	private async Task<ObservableRangeCollection<object>> ApplyDistanceFilterWithoutEtasAsync(DistanceFilter filter)
 	{
 		try
 		{
@@ -4117,16 +4250,14 @@ public partial class MainPage : ContentPage
 			if (_userLocation == null || filter == DistanceFilter.All)
 			{
 				var resultsList = FilterRoutesInternal();
-				await MainThread.InvokeOnMainThreadAsync(() => {
-					KeyboardManager.UpdateAvailableRouteChars(resultsList.OfType<TransportRoute>().ToList(), _searchQuery);
-				});
+				// Removed KeyboardManager update here, should be handled by caller if needed after final list is ready
 				
 				var result = new ObservableRangeCollection<object>();
 				result.BeginBatch();
 				result.AddRange(resultsList);
 				result.EndBatch();
-				Routes = result;
-				return;
+				// Removed: Routes = result;
+				return result;
 			}
 			
 			// Get the list of nearby stops for the selected distance
@@ -4161,15 +4292,15 @@ public partial class MainPage : ContentPage
 			// If no nearby stops found, show empty list
 			if (nearbyStops.Count == 0)
 			{
-				string noRoutesText = $"No stops found within {filter.ToString().Replace("Meters", "")} of your location.";
-				var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
-				if (noRoutesLabel != null)
-				{
-					noRoutesLabel.Text = noRoutesText;
-				}
+				// string noRoutesText = $"No stops found within {filter.ToString().Replace("Meters", "")} of your location.";
+				// var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
+				// if (noRoutesLabel != null)
+				// {
+				// noRoutesLabel.Text = noRoutesText;
+				// }
     
-				Routes = filteredItems;
-				return;
+				// Removed: Routes = filteredItems;
+				return filteredItems; // Return empty collection
 			}
 			
 			// Sort stops by distance for better UX
@@ -4221,22 +4352,23 @@ public partial class MainPage : ContentPage
 			_logger?.LogInformation("Displaying {count} stop groups without ETAs", stopGroups.Count);
 			
 			// Update UI with these stop groups immediately
-			Routes = filteredItems;
+			// Removed: Routes = filteredItems;
 			
 			// Force the collection view to update
-			var collectionView = this.FindByName<CollectionView>("RoutesCollection");
-			if (collectionView != null)
-			{
-				collectionView.ItemsSource = null;
-				collectionView.ItemsSource = filteredItems;
-			}
+			// var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+			// if (collectionView != null)
+			// {
+			// collectionView.ItemsSource = null;
+			// collectionView.ItemsSource = filteredItems;
+			// }
+			return filteredItems;
 		}
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Error in ApplyDistanceFilterWithoutEtasAsync: {message}", ex.Message);
 			
 			// Return empty collection on error
-			return;
+			return new ObservableRangeCollection<object>();
 		}
 	}
 }
