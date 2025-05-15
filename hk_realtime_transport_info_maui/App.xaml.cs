@@ -12,6 +12,7 @@ namespace hk_realtime_transport_info_maui;
 public partial class App : Application
 {
 	private readonly KmbDataService _kmbDataService;
+	private readonly MtrDataService _mtrDataService;
 	private readonly ILogger<App> _logger;
 	private readonly LiteDbService _databaseService;
 	private static readonly ConcurrentDictionary<string, Action> _dataReadyCallbacks = new();
@@ -39,12 +40,13 @@ public partial class App : Application
 		{ "Refresh", "Refresh" }
 	};
 
-	public App(KmbDataService kmbDataService, ILogger<App> logger, LiteDbService databaseService)
+	public App(KmbDataService kmbDataService, MtrDataService mtrDataService, ILogger<App> logger, LiteDbService databaseService)
 	{
 		// Initialize components
 		InitializeComponent();
 		
 		_kmbDataService = kmbDataService;
+		_mtrDataService = mtrDataService;
 		_logger = logger;
 		_databaseService = databaseService;
 		
@@ -231,7 +233,7 @@ public partial class App : Application
 			}
 			
 			// Create a custom window with our own AppShell
-			return new Window(new AppShell(_databaseService, _kmbDataService, etaService, logger, locationCacheService));
+			return new Window(new AppShell(_databaseService, _kmbDataService, _mtrDataService, etaService, logger, locationCacheService));
 		}
 		catch (Exception ex)
 		{
@@ -246,6 +248,7 @@ public partial class App : Application
 		{
 			// Start data download process (returns immediately due to improvements)
 			await _kmbDataService.DownloadAllDataAsync(forceRefresh).ConfigureAwait(false);
+			await _mtrDataService.DownloadAllDataAsync(forceRefresh).ConfigureAwait(false);
 			
 			// Register for progress events
 			EventHandler<DownloadProgressEventArgs>? progressHandler = null;
@@ -280,6 +283,7 @@ public partial class App : Application
 			
 			// Add the handler
 			_kmbDataService.ProgressChanged += progressHandler;
+			_mtrDataService.ProgressChanged += progressHandler;
 			
 			try 
 			{
@@ -290,6 +294,7 @@ public partial class App : Application
 			{
 				// Always remove the handler
 				_kmbDataService.ProgressChanged -= progressHandler;
+				_mtrDataService.ProgressChanged -= progressHandler;
 			}
 			
 			_dataInitialized = true;

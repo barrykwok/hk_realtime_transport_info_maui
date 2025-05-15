@@ -9,12 +9,13 @@ public partial class AppShell : Shell
 {
 	private readonly LiteDbService _databaseService;
 	private readonly KmbDataService _kmbDataService;
+	private readonly MtrDataService _mtrDataService;
 	private readonly EtaService _etaService;
 	private readonly ILogger<MainPage> _logger;
 	private readonly LocationCacheService _locationCacheService;
 	private MainPage _mainPage;
 
-	public AppShell(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, 
+	public AppShell(LiteDbService databaseService, KmbDataService kmbDataService, MtrDataService mtrDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
 	{
 		// Manually initialize components from XAML
@@ -22,6 +23,7 @@ public partial class AppShell : Shell
 		
 		_databaseService = databaseService;
 		_kmbDataService = kmbDataService;
+		_mtrDataService = mtrDataService;
 		_etaService = etaService;
 		_logger = logger;
 		_locationCacheService = locationCacheService;
@@ -30,7 +32,7 @@ public partial class AppShell : Shell
 		Title = App.GetString("AppTitle", "HK Transport Info");
 		
 		// Create the main page instance and keep a reference
-		_mainPage = new MainPage(_databaseService, _kmbDataService, _etaService, _logger, _locationCacheService);
+		_mainPage = new MainPage(_databaseService, _kmbDataService, _mtrDataService, _etaService, _logger, _locationCacheService);
 		
 		// Register routes
 		Routing.RegisterRoute(nameof(MainPage), typeof(MainPage));

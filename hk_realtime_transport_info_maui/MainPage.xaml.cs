@@ -558,6 +558,7 @@ public partial class MainPage : ContentPage
 {
 	private readonly LiteDbService _databaseService;
 	private readonly KmbDataService _kmbDataService;
+	private readonly MtrDataService _mtrDataService;
 	private readonly EtaService _etaService;
 	private readonly ILogger<MainPage> _logger;
 	private readonly LocationCacheService _locationCacheService; // Added LocationCacheService
@@ -781,7 +782,7 @@ public partial class MainPage : ContentPage
 	// Timer for ETA display text updates (updates display without fetching new ETAs)
 	private IDispatcherTimer? _etaDisplayUpdateTimer;
 
-	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, 
+	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, MtrDataService mtrDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
 	{
 		// Initialize the XAML components
@@ -790,6 +791,7 @@ public partial class MainPage : ContentPage
 		
 		_databaseService = databaseService;
 		_kmbDataService = kmbDataService;
+		_mtrDataService = mtrDataService;
 		_etaService = etaService;
 		_logger = logger;
 		_locationCacheService = locationCacheService; // Store the LocationCacheService
@@ -799,6 +801,7 @@ public partial class MainPage : ContentPage
 		
 		// Subscribe to progress events
 		_kmbDataService.ProgressChanged += OnDownloadProgressChanged;
+		_mtrDataService.ProgressChanged += OnDownloadProgressChanged;
 		
 		// Disable the built-in keyboard for the search bar
 		RouteSearchBar.IsSpellCheckEnabled = false;

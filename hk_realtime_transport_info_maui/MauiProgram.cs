@@ -97,6 +97,17 @@ public static class MauiProgram
 			return new KmbDataService(liteDbService, httpClientUtility, logger);
 		});
 		
+		// Register MTR data service
+		builder.Services.AddSingleton<MtrDataService>(sp =>
+		{
+			var httpClientUtility = sp.GetRequiredService<HttpClientUtility>();
+			var liteDbService = sp.GetRequiredService<LiteDbService>();
+			var logger = sp.GetRequiredService<ILogger<MtrDataService>>();
+			var cacheService = sp.GetRequiredService<CacheService>();
+			
+			return new MtrDataService(liteDbService, httpClientUtility, logger, cacheService);
+		});
+		
 		// Register ETA service
 		builder.Services.AddSingleton<EtaService>(sp => 
 		{
@@ -158,10 +169,11 @@ public static class MauiProgram
 		builder.Services.AddTransient<MainPage>(sp => {
 			var databaseService = sp.GetRequiredService<LiteDbService>();
 			var kmbDataService = sp.GetRequiredService<KmbDataService>();
+			var mtrDataService = sp.GetRequiredService<MtrDataService>();
 			var etaService = sp.GetRequiredService<EtaService>();
 			var logger = sp.GetRequiredService<ILogger<MainPage>>();
 			var locationCacheService = sp.GetRequiredService<LocationCacheService>();
-			return new MainPage(databaseService, kmbDataService, etaService, logger, locationCacheService);
+			return new MainPage(databaseService, kmbDataService, mtrDataService, etaService, logger, locationCacheService);
 		});
 		builder.Services.AddTransient<RouteDetailsPage>();
 

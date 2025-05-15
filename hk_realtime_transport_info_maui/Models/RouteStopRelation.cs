@@ -21,6 +21,9 @@ namespace hk_realtime_transport_info_maui.Models
         // Optional direction information if the route has multiple directions
         public string Direction { get; set; }
         
+        // Operator (e.g., KMB, MTR)
+        public TransportOperator Operator { get; set; }
+        
         // Last time this relationship was updated
         public DateTime LastUpdated { get; set; }
         
