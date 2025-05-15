@@ -100,8 +100,8 @@ namespace hk_realtime_transport_info_maui.Services
             {
                 // Set _lastRequestTime to current time to prevent runaway calculations and disable interval-based delay.
                 _lastRequestTime = now; 
-            }
-            
+                }
+                
             // Since delayMs is not calculated to be > 0 by this method's new logic, 
             // the Task.Delay will not be hit from here.
             // Original delay logic:
@@ -732,20 +732,20 @@ namespace hk_realtime_transport_info_maui.Services
                 _logger?.LogDebug("Retrieved all ETAs for KMB stop {stopId} from cache", stopId);
                 return cachedEtas;
             }
-
+            
             // If we recently determined this stop has no ETAs, return empty list quickly
             if (_stopHasNoEtas.ContainsKey(stopId))
-            {
-                _logger?.LogDebug("Stop {stopId} previously determined to have no ETAs, returning empty list from quick check.", stopId);
-                return new List<TransportEta>();
-            }
-
-            int retryCount = 0;
-            string url = string.Empty; // Declare url outside the try block
-            while (true)
-            {
-                try
                 {
+                _logger?.LogDebug("Stop {stopId} previously determined to have no ETAs, returning empty list from quick check.", stopId);
+                    return new List<TransportEta>();
+                }
+                
+                int retryCount = 0;
+            string url = string.Empty; // Declare url outside the try block
+                while (true)
+                {
+                    try
+                    {
                     // await ApplyRateLimiting(); // Rate limiting handled by HttpClientUtility
 
                     // Modify StopId for KMB API if needed
@@ -755,13 +755,13 @@ namespace hk_realtime_transport_info_maui.Services
 
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); // 10-second timeout
                     var response = await _httpClient.GetAsync(url, cts.Token);
-                    
-                    if (!response.IsSuccessStatusCode)
-                    {
+                        
+                        if (!response.IsSuccessStatusCode)
+                        {
                         // Log the initial failure
                         _logger?.LogWarning("[EtaService] KMB ETA API call for stop {kmbStopId} failed. Status: {statusCode}, URL: {apiUrl}",
                             stopId, response.StatusCode, url);
-
+                                
                         if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
                         {
                             // For 422, typically means bad request (e.g. invalid stopId).
@@ -805,43 +805,43 @@ namespace hk_realtime_transport_info_maui.Services
                     
                     // If successful, reset retryCount (though typically we return shortly after success)
                     // retryCount = 0; 
-
-                    // Read the response as JSON
-                    var responseData = await response.Content.ReadAsStreamAsync();
-                    var kmbResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(responseData, _jsonOptions);
-                    
-                    if (kmbResponse?.Data == null)
-                    {
+                        
+                        // Read the response as JSON
+                        var responseData = await response.Content.ReadAsStreamAsync();
+                        var kmbResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(responseData, _jsonOptions);
+                        
+                        if (kmbResponse?.Data == null)
+                        {
                         _logger?.LogWarning("KMB ETA API returned null response or data for stop {kmbStopId} (URL: {apiUrl})", stopId, url);
                         _stopHasNoEtas[stopId] = true;
                         var emptyList = new List<TransportEta>();
                         return emptyList;
-                    }
-                    
-                    _logger?.LogDebug("Processing ETAs for KMB stop {kmbStopId} with auto-assignment of stop ID for ETAs with empty stop ID", stopId);
-                    
+                        }
+                        
+                        _logger?.LogDebug("Processing ETAs for KMB stop {kmbStopId} with auto-assignment of stop ID for ETAs with empty stop ID", stopId);
+                        
                     // Convert to internal format
                     var result = ConvertKmbEtas(kmbResponse, stopId); // Pass only kmbResponse and stopId
                     
                     // Cache the results - use a shorter expiration for stops with no ETAs
                     TimeSpan cacheExpiry = result.Count > 0 ? TimeSpan.FromSeconds(25) : TimeSpan.FromSeconds(15);
                     _cacheService.Set(cacheKey, result, cacheExpiry);
-                    
+                        
                     // Record if this stop has ETAs
                     _stopHasNoEtas[stopId] = result.Count == 0;
-                    
+                        
                     // Complete the task
-                    return result;
-                }
-                catch (HttpRequestException ex)
-                {
+                        return result;
+                    }
+                    catch (HttpRequestException ex)
+                    {
                     // Handle HTTP request errors
                     _logger?.LogError(ex, "HTTP request error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
                         stopId, ex.Message, url);
-                    return new List<TransportEta>();
-                }
-                catch (JsonException ex)
-                {
+                        return new List<TransportEta>();
+                    }
+                    catch (JsonException ex)
+                    {
                     // Handle JSON deserialization errors
                     _logger?.LogError(ex, "JSON deserialization error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
                         stopId, ex.Message, url);
@@ -851,10 +851,10 @@ namespace hk_realtime_transport_info_maui.Services
                         await Task.Delay(RetryDelayMilliseconds * retryCount); // Exponential backoff
                         continue; 
                     }
-                    return new List<TransportEta>();
-                }
-                catch (TaskCanceledException ex)
-                {
+                        return new List<TransportEta>();
+                    }
+                    catch (TaskCanceledException ex)
+                    {
                     // Handle task cancellation (timeout)
                     _logger?.LogWarning(ex, "Task canceled (timeout) fetching ETAs for KMB stop {kmbStopId} (URL: {apiUrl})", 
                         stopId, url);
@@ -864,14 +864,14 @@ namespace hk_realtime_transport_info_maui.Services
                         await Task.Delay(RetryDelayMilliseconds * retryCount); // Exponential backoff
                         continue;
                     }
-                    return new List<TransportEta>();
-                }
-                catch (Exception ex)
-                {
-                    // Handle all other errors
+                        return new List<TransportEta>();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Handle all other errors
                     _logger?.LogError(ex, "Unexpected error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
                         stopId, ex.Message, url);
-                    return new List<TransportEta>();
+                        return new List<TransportEta>();
                 }
             }
         }

@@ -26,15 +26,22 @@ namespace hk_realtime_transport_info_maui.Services
         
         // Cache for routes by stop
         private ConcurrentDictionary<string, Tuple<DateTime, List<TransportRoute>>>? _routesByStopCache;
+        private static readonly TimeSpan RouteByStopCacheDuration = TimeSpan.FromHours(1);
         
         // Add a private field for all stops caching
         private List<TransportStop> _cachedAllStops;
         
         public LiteDbService(ILogger<LiteDbService>? logger = null)
         {
-            _dbPath = Path.Combine(FileSystem.AppDataDirectory, "transport_litedb.db");
             _logger = logger;
-            
+            var basePath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            _dbPath = Path.Combine(basePath, "transport_data.db");
+            _logger?.LogInformation("Database path: {DbPath}", _dbPath);
+
+            // Initialize caches here
+            _routesByStopCache = new ConcurrentDictionary<string, Tuple<DateTime, List<TransportRoute>>>();
+            _cachedAllStops = new List<TransportStop>(); // Ensure _cachedAllStops is initialized if used before assignment
+
             try
             {
                 // Ensure directory exists
@@ -808,21 +815,27 @@ namespace hk_realtime_transport_info_maui.Services
         
         public async Task<List<TransportRoute>> GetRoutesForStopAsync(string stopId)
         {
+            if (string.IsNullOrEmpty(stopId))
+            {
+                _logger?.LogWarning("GetRoutesForStopAsync received null or empty stopId.");
+                return new List<TransportRoute>();
+            }
+
             // Check cache first
             if (_routesByStopCache != null && _routesByStopCache.TryGetValue(stopId, out var cachedEntry))
             {
-                // Check if cache entry is still valid (e.g., within 1 hour)
-                if (DateTime.UtcNow - cachedEntry.Item1 < TimeSpan.FromHours(1))
+                if (DateTime.UtcNow - cachedEntry.Item1 < RouteByStopCacheDuration) // Use the defined cache duration
                 {
-                    _logger?.LogDebug("Returning cached routes for stop {stopId}", stopId);
+                    _logger?.LogDebug("GetRoutesForStopAsync (standard): Cache hit for stopId {StopId}. Returning {Count} routes.", stopId, cachedEntry.Item2.Count);
                     return cachedEntry.Item2;
                 }
                 else
                 {
-                    // Cache entry expired, remove it
-                    _routesByStopCache.TryRemove(stopId, out _);
+                    _logger?.LogDebug("GetRoutesForStopAsync (standard): Cache expired for stopId {StopId}.", stopId);
+                    _routesByStopCache.TryRemove(stopId, out _); // Attempt to remove expired entry
                 }
             }
+            _logger?.LogDebug("GetRoutesForStopAsync (standard): Cache miss or expired for stopId {StopId}. Fetching from DB.", stopId);
 
             var routes = new List<TransportRoute>();
             try
@@ -831,39 +844,20 @@ namespace hk_realtime_transport_info_maui.Services
                 var relationCollection = db.GetCollection<RouteStopRelation>("RouteStopRelations");
                 var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
 
-                // Trim stopId and log information
-                var trimmedStopId = stopId?.Trim();
-                if (string.IsNullOrEmpty(trimmedStopId))
-                {
-                    _logger?.LogWarning("GetRoutesForStopAsync received null or empty stopId.");
-                    return routes; // Return empty list
-                }
+                var trimmedStopId = stopId.Trim();
                 _logger?.LogDebug("Querying relations for trimmed StopId: '{trimmedStopId}'. Original was: '{originalStopId}'", trimmedStopId, stopId);
 
-
-                // Find relations for the stop
                 var relations = relationCollection.Find(r => r.StopId == trimmedStopId).ToList();
-                
-                _logger?.LogDebug("Found {relationCount} relations for stopId '{trimmedStopId}'. Total relations in DB: {totalRelations}", relations.Count, trimmedStopId, relationCollection.Count());
+                _logger?.LogDebug("Found {relationCount} relations for stopId '{trimmedStopId}'.", relations.Count, trimmedStopId);
 
                 if (relations.Any())
                 {
                     var routeIds = relations.Select(r => r.RouteId?.Trim()).Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
-                    _logger?.LogDebug("Extracted {count} distinct, trimmed RouteIds for stopId '{stopId}'. Sample IDs: {sampleIds}", 
+                    _logger?.LogDebug("Extracted {count} distinct, trimmed RouteIds for stopId '{stopId}'. Sample IDs: {sampleIds}",
                         routeIds.Count, trimmedStopId, string.Join(", ", routeIds.Take(5)));
 
                     if (routeIds.Any())
                     {
-                        // Diagnostic: Try fetching one route directly
-                        var firstRouteIdToTest = routeIds.First();
-                        var testRoute = routeCollection.FindById(new BsonValue(firstRouteIdToTest));
-                        _logger?.LogDebug("Diagnostic: Attempted to fetch route with ID '{testId}' directly. Found: {wasFound}", 
-                            firstRouteIdToTest, testRoute != null);
-                        if (testRoute != null) {
-                            _logger?.LogDebug("Diagnostic: Test route details - ID: {routeId}, Number: {routeNum}, Operator: {routeOp}", testRoute.Id, testRoute.RouteNumber, testRoute.Operator.ToString());
-                        }
-
-                        // Fetch routes individually as Query.In seems to have issues with string IDs that might be ObjectIds
                         var foundRoutes = new List<TransportRoute>();
                         foreach (var routeId in routeIds)
                         {
@@ -887,32 +881,132 @@ namespace hk_realtime_transport_info_maui.Services
                 }
                 
                 _logger?.LogDebug("Found {count} routes for stop {stopId} from database", routes.Count, trimmedStopId);
-
-                // Update cache only if routes were found
-                if (routes.Any())
+                
+                // Add to cache before returning
+                if (_routesByStopCache != null)
                 {
-                    _routesByStopCache ??= new ConcurrentDictionary<string, Tuple<DateTime, List<TransportRoute>>>();
-                    _routesByStopCache[trimmedStopId] = new Tuple<DateTime, List<TransportRoute>>(DateTime.UtcNow, routes);
-                }
-                else
-                {
-                    // If an old cached entry existed (potentially with routes), 
-                    // and now no routes are found, remove the old entry.
-                    // This prevents serving stale data if routes for a stop are removed or relations change.
-                    if (_routesByStopCache != null && _routesByStopCache.ContainsKey(trimmedStopId))
-                    {
-                        _routesByStopCache.TryRemove(trimmedStopId, out _);
-                        _logger?.LogDebug("Removed prior cached entry for stop {stopId} as no routes are currently found.", trimmedStopId);
-                    }
-                    else
-                    {
-                        _logger?.LogDebug("No routes found for stop {stopId}, and no prior cache entry existed. Not caching empty list.", trimmedStopId);
-                    }
+                    _routesByStopCache[stopId] = Tuple.Create(DateTime.UtcNow, routes);
+                     _logger?.LogDebug("GetRoutesForStopAsync (standard): Cached {Count} routes for stopId {StopId}.", routes.Count, stopId);
                 }
             }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "Error getting routes for stop {stopId}", stopId);
+            }
+            return routes;
+        }
+        
+        // Overload that accepts a dictionary of all master routes for performance
+        public async Task<List<TransportRoute>> GetRoutesForStopAsync(string stopId, Dictionary<string, TransportRoute>? allMasterRoutesDict)
+        {
+            if (string.IsNullOrEmpty(stopId))
+            {
+                _logger?.LogWarning("GetRoutesForStopAsync (dict overload) received null or empty stopId.");
+                return new List<TransportRoute>();
+            }
+
+            // Check cache first using the same _routesByStopCache and duration
+            if (_routesByStopCache != null && _routesByStopCache.TryGetValue(stopId, out var cachedEntry))
+            {
+                if (DateTime.UtcNow - cachedEntry.Item1 < RouteByStopCacheDuration)
+                {
+                    _logger?.LogDebug("[DictOverload] Cache hit for stopId {StopId}. Returning {Count} routes.", stopId, cachedEntry.Item2.Count);
+                    return cachedEntry.Item2;
+                }
+                else
+                {
+                    _logger?.LogDebug("[DictOverload] Cache expired for stopId {StopId}.", stopId);
+                    _routesByStopCache.TryRemove(stopId, out _); // Attempt to remove expired entry
+                }
+            }
+            _logger?.LogDebug("[DictOverload] Cache miss or expired for stopId {StopId}. Fetching from DB/dictionary.", stopId);
+
+            var routes = new List<TransportRoute>();
+            try
+            {
+                var db = GetDatabase();
+                var relationCollection = db.GetCollection<RouteStopRelation>("RouteStopRelations");
+                var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes"); // For fallback
+
+                var trimmedStopId = stopId.Trim();
+                _logger?.LogDebug("[DictOverload] Querying relations for trimmed StopId: '{trimmedStopId}'. Original was: '{originalStopId}'", trimmedStopId, stopId);
+
+                var relations = relationCollection.Find(r => r.StopId == trimmedStopId).ToList();
+                _logger?.LogDebug("[DictOverload] Found {relationCount} relations for stopId '{trimmedStopId}'.", relations.Count, trimmedStopId);
+
+                if (relations.Any())
+                {
+                    var routeIds = relations.Select(r => r.RouteId?.Trim()).Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
+                    _logger?.LogDebug("[DictOverload] Extracted {count} distinct, trimmed RouteIds for stopId '{stopId}'. Sample IDs: {sampleIds}",
+                        routeIds.Count, trimmedStopId, string.Join(", ", routeIds.Take(5)));
+
+                    if (routeIds.Any())
+                    {
+                        var foundRoutes = new List<TransportRoute>();
+                        foreach (var routeIdString in routeIds) // Ensure routeIdString is not null before use
+                        {
+                            if (string.IsNullOrEmpty(routeIdString)) continue; 
+
+                            TransportRoute? route = null;
+                            // bool foundInDict = false; // For more detailed logging if needed
+
+                            if (allMasterRoutesDict != null && allMasterRoutesDict.TryGetValue(routeIdString, out var dictRoute))
+                            {
+                                route = dictRoute;
+                                // foundInDict = true;
+                            }
+                            else
+                            {
+                                if (allMasterRoutesDict == null)
+                                {
+                                    _logger?.LogInformation("[DictOverload] allMasterRoutesDict is null. Falling back to DB for routeId '{routeIdString}' for stop '{trimmedStopId}'.", routeIdString, trimmedStopId);
+                                }
+                                else
+                                {
+                                    _logger?.LogInformation("[DictOverload] RouteId '{routeIdString}' not found in allMasterRoutesDict (count: {dictCount}) for stop '{trimmedStopId}'. Falling back to DB.", routeIdString, allMasterRoutesDict.Count, trimmedStopId);
+                                }
+                                
+                                try 
+                                {
+                                    route = routeCollection.FindById(new BsonValue(routeIdString));
+                                    if (route != null)
+                                    {
+                                        _logger?.LogDebug("[DictOverload] Fallback DB lookup successful for routeId '{routeIdString}'.", routeIdString);
+                                    }
+                                    else
+                                    {
+                                        _logger?.LogWarning("[DictOverload] Fallback DB lookup FAILED for routeId '{routeIdString}' for stop '{trimmedStopId}'.", routeIdString, trimmedStopId);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger?.LogError(ex, "[DictOverload] Exception during fallback DB lookup for routeId '{routeIdString}'.", routeIdString);
+                                }
+                            }
+
+                            if (route != null)
+                            {
+                                foundRoutes.Add(route);
+                            }
+                        }
+                        routes = foundRoutes;
+                        _logger?.LogDebug("[DictOverload] After processing, found {count} routes for stopId '{trimmedStopId}'. Attempted to use dictionary for {routeIdCount} IDs.", routes.Count, trimmedStopId, routeIds.Count);
+                    }
+                    else
+                    {
+                        _logger?.LogWarning("[DictOverload] No valid RouteIds found after trimming and filtering for stopId '{trimmedStopId}'", trimmedStopId);
+                    }
+                }
+                // Add to cache before returning
+                if (_routesByStopCache != null)
+                {
+                    _routesByStopCache[stopId] = Tuple.Create(DateTime.UtcNow, routes);
+                    _logger?.LogDebug("[DictOverload] Cached {Count} routes for stopId {StopId}.", routes.Count, stopId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "[DictOverload] Error getting routes for stop {stopId}", stopId);
             }
             return routes;
         }
