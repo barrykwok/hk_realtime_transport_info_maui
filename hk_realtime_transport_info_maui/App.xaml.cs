@@ -219,18 +219,19 @@ public partial class App : Application
 		
 		try
 		{
-			// Get ETA service from DI
+			// Get services from DI
 			var etaService = services.GetService<EtaService>();
 			var loggerFactory = services.GetService<ILoggerFactory>();
 			var logger = loggerFactory?.CreateLogger<MainPage>();
+			var locationCacheService = services.GetService<LocationCacheService>();
 		
-			if (etaService == null || logger == null)
-		{
+			if (etaService == null || logger == null || locationCacheService == null)
+			{
 				return base.CreateWindow(activationState);
 			}
 			
 			// Create a custom window with our own AppShell
-			return new Window(new AppShell(_databaseService, _kmbDataService, etaService, logger));
+			return new Window(new AppShell(_databaseService, _kmbDataService, etaService, logger, locationCacheService));
 		}
 		catch (Exception ex)
 		{

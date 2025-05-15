@@ -560,6 +560,7 @@ public partial class MainPage : ContentPage
 	private readonly KmbDataService _kmbDataService;
 	private readonly EtaService _etaService;
 	private readonly ILogger<MainPage> _logger;
+	private readonly LocationCacheService _locationCacheService; // Added LocationCacheService
 	private ObservableRangeCollection<object> _routes = new(); // Use object for mixed types
 	private ObservableRangeCollection<object> _filteredRoutes = new(); // Use object for mixed types
 	private List<TransportRoute> _allRoutes = new();
@@ -776,7 +777,8 @@ public partial class MainPage : ContentPage
 
 	private readonly SemaphoreSlim _adaptLock = new SemaphoreSlim(1, 1);
 
-	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, ILogger<MainPage> logger)
+	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, 
+		ILogger<MainPage> logger, LocationCacheService locationCacheService)
 	{
 		// Initialize the XAML components
 		
@@ -786,6 +788,7 @@ public partial class MainPage : ContentPage
 		_kmbDataService = kmbDataService;
 		_etaService = etaService;
 		_logger = logger;
+		_locationCacheService = locationCacheService; // Store the LocationCacheService
 		
 		// Initialize debouncing token source
 		_filterCancellationTokenSource = new CancellationTokenSource();
@@ -1861,70 +1864,24 @@ public partial class MainPage : ContentPage
 		try
 		{
 			IsRefreshing = true;
-			var userFullGeohash = NGeoHash.GeoHash.Encode(_userLocation.Latitude, _userLocation.Longitude, 8); 
-			string centerGeoHash6 = userFullGeohash.Substring(0, Math.Min(6, userFullGeohash.Length));
-
 			_logger.LogInformation("UpdateNearbyStops: Current user location is Lat={Lat}, Lng={Lng}", _userLocation.Latitude, _userLocation.Longitude);
-			_logger.LogDebug("UpdateNearbyStops: User location geohash: CenterGH6={CenterGH6}, FullGH8={FullGH8}", centerGeoHash6, userFullGeohash);
-
-			List<TransportStop> stopsFromGeoHashQuery;
-
-			// Check new cache first, keyed by centerGeoHash6
-			if (_cachedRawStopsByCenterGeoHash6.TryGetValue(centerGeoHash6, out var cachedStops))
-			{
-			    _logger.LogDebug("UpdateNearbyStops: Using cached raw stops ({Count}) for CenterGeoHash6 {CenterGeoHash6}.", cachedStops.Count, centerGeoHash6);
-			    stopsFromGeoHashQuery = cachedStops;
-			}
-			else
-			{
-			    var neighboringGeohashes = GetNeighboringGeohashes(centerGeoHash6); 
-			    _logger.LogDebug("UpdateNearbyStops: Cache miss for CenterGeoHash6 {CenterGeoHash6}. Querying DB for its neighbors: {Geohashes}", centerGeoHash6, string.Join(", ", neighboringGeohashes));
-			    stopsFromGeoHashQuery = _databaseService.GetStopsByGeoHash6List(neighboringGeohashes);
-			    _cachedRawStopsByCenterGeoHash6[centerGeoHash6] = stopsFromGeoHashQuery; // Store in new cache
-			    _logger.LogDebug("UpdateNearbyStops: Cached {Count} raw stops for CenterGeoHash6 {CenterGeoHash6}.", stopsFromGeoHashQuery.Count, centerGeoHash6);
-			}
 			
-			_logger.LogDebug("UpdateNearbyStops: Got {Count} stops (from DB or cache) based on CenterGeoHash6 {CenterGeoHash6}", stopsFromGeoHashQuery.Count, centerGeoHash6);
+			var userFullGeohash = NGeoHash.GeoHash.Encode(_userLocation.Latitude, _userLocation.Longitude, 8); 
+			_logger.LogDebug("UpdateNearbyStops: User location geohash: CenterGH6={CenterGH6}, FullGH8={FullGH8}", 
+				userFullGeohash.Substring(0, Math.Min(6, userFullGeohash.Length)), userFullGeohash);
 
-			if (!stopsFromGeoHashQuery.Any())
+			// Get nearby stops using the LocationCacheService instead of local cache or direct DB call
+			List<TransportStop> nearbyStops = await _locationCacheService.GetNearbyStopsAsync(
+				_userLocation.Latitude, _userLocation.Longitude, 1000);
+				
+			_logger.LogDebug("UpdateNearbyStops: Found {0} potential nearby stops", nearbyStops.Count);
+			
+			if (!nearbyStops.Any())
 			{
-				_logger.LogWarning("UpdateNearbyStops: No stops found in database for the given CenterGeoHash6 values.");
+				_logger.LogWarning("UpdateNearbyStops: No stops found in database for the current location.");
 				IsRefreshing = false;
 				return;
 			}
-			
-			_logger.LogDebug("UpdateNearbyStops: Found {0} potential nearby stops after distance filtering the CenterGeoHash6 list", stopsFromGeoHashQuery.Count);
-			
-			// If we don't have enough potential nearby stops, use direct distance calculation for all stops
-			// This ensures we capture stops that might be missed by geohash matching
-			if (stopsFromGeoHashQuery.Count < 5)
-			{
-				_logger.LogInformation("Found only {0} stops via initial CenterGeoHash6 list processing - this count might be low, check CenterGeoHash logic or stop data.", stopsFromGeoHashQuery.Count);
-				
-				// This is computationally expensive but necessary as a last resort
-				foreach (var stop in stopsFromGeoHashQuery)
-				{
-					if (stop.Latitude == 0 || stop.Longitude == 0) continue;
-					
-					// Calculate actual distance directly
-					var stopLocation = new Location(stop.Latitude, stop.Longitude);
-					double distanceInMeters = Location.CalculateDistance(
-						new Location(_userLocation.Latitude, _userLocation.Longitude), 
-						stopLocation, DistanceUnits.Kilometers) * 1000;
-					
-					// Use a larger radius initially to ensure we find some stops
-					if (distanceInMeters <= 1000)
-					{
-						stopsFromGeoHashQuery.Add(stop);
-						_logger?.LogDebug("Direct distance: Found stop {stopName} at {distance}m", stop.LocalizedName, distanceInMeters.ToString("F1"));
-					}
-				}
-			}
-			
-			_logger.LogDebug("UpdateNearbyStops: Found {0} potential nearby stops", stopsFromGeoHashQuery.Count);
-			
-			// Pre-calculate the location once
-			var userLocation = new Location(_userLocation.Latitude, _userLocation.Longitude);
 
 			// Create concurrent bags for thread-safe collection
 			var stops100m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
@@ -1932,44 +1889,30 @@ public partial class MainPage : ContentPage
 			var stops400m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
 			var stops600m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
 
-			// Use parallel processing to speed up distance calculations, but only on the filtered set
-			await Task.Run(() => {
-				Parallel.ForEach(stopsFromGeoHashQuery, stop => {
-					// Skip stops without coordinates
-					if (stop.Latitude == 0 && stop.Longitude == 0)
+			// Process stops based on their distance (already calculated by LocationCacheService)
+			foreach (var stop in nearbyStops)
+			{
+				// Add to appropriate distance buckets
+				if (stop.DistanceFromUser <= 600)
+				{
+					stops600m.Add(stop);
+					
+					if (stop.DistanceFromUser <= 400)
 					{
-						return;
-					}
-					
-					// Calculate exact distance
-					var stopLocation = new Location(stop.Latitude, stop.Longitude);
-					double distanceInMeters = Location.CalculateDistance(userLocation, stopLocation, DistanceUnits.Kilometers) * 1000;
-					
-					// Set the distance on the stop for later sorting and display
-					stop.DistanceFromUser = distanceInMeters;
-					
-					// Add to appropriate distance buckets
-					if (distanceInMeters <= 600)
-					{
-						stops600m.Add(stop);
+						stops400m.Add(stop);
 						
-						if (distanceInMeters <= 400)
+						if (stop.DistanceFromUser <= 200)
 						{
-							stops400m.Add(stop);
+							stops200m.Add(stop);
 							
-							if (distanceInMeters <= 200)
+							if (stop.DistanceFromUser <= 100)
 							{
-								stops200m.Add(stop);
-								
-								if (distanceInMeters <= 100)
-								{
-									stops100m.Add(stop);
-								}
+								stops100m.Add(stop);
 							}
 						}
 					}
-				});
-			});
+				}
+			}
 
 			// Store the results
 			_stopsNearby["100m"] = stops100m.ToList();

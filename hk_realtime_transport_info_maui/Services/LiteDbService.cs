@@ -1130,6 +1130,9 @@ namespace hk_realtime_transport_info_maui.Services
                 
             if (!db.CollectionExists("RouteStopRelations"))
                 db.GetCollection<RouteStopRelation>("RouteStopRelations");
+                
+            if (!db.CollectionExists(CollectionNames.CACHED_LOCATIONS))
+                db.GetCollection<CachedLocation>(CollectionNames.CACHED_LOCATIONS);
         }
         
         private void CreateIndexes()
@@ -1185,6 +1188,15 @@ namespace hk_realtime_transport_info_maui.Services
             relationCollection.EnsureIndex(r => r.RouteId);
             relationCollection.EnsureIndex(r => r.StopId);
             relationCollection.EnsureIndex("RouteStop", "$.RouteId + '_' + $.StopId");
+            
+            // CachedLocations
+            var cachedLocationCollection = db.GetCollection<CachedLocation>(CollectionNames.CACHED_LOCATIONS);
+            cachedLocationCollection.EnsureIndex(c => c.Id);
+            cachedLocationCollection.EnsureIndex(c => c.GeoHash6);
+            cachedLocationCollection.EnsureIndex(c => c.GeoHash7);
+            cachedLocationCollection.EnsureIndex(c => c.GeoHash8);
+            cachedLocationCollection.EnsureIndex(c => c.LastAccessed);
+            cachedLocationCollection.EnsureIndex(c => c.AccessCount);
         }
         
         public void AnalyzeAndOptimizeDatabase()
@@ -1219,15 +1231,30 @@ namespace hk_realtime_transport_info_maui.Services
                     // Calculate geohashes for faster filtering
                     string geoHash6 = GeoHash.Encode(latitude, longitude, 6);
                     string geoHash5 = geoHash6.Substring(0, 5);
+                    string geoHash4 = geoHash5.Substring(0, 4); // Even broader area
                     
-                    // First use geohash prefix filtering (very fast)
+                    // First use geohash prefix filtering (very fast) with wider search area
                     var potentialMatches = _cachedAllStops
                         .Where(s => s.GeoHash6 == geoHash6 || 
                                s.GeoHash6.StartsWith(geoHash5) || 
-                               geoHash6.StartsWith(s.GeoHash6.Substring(0, 5)))
+                               s.GeoHash6.StartsWith(geoHash4) || // Add broader area match
+                               geoHash6.StartsWith(s.GeoHash6.Substring(0, 5)) ||
+                               geoHash6.StartsWith(s.GeoHash6.Substring(0, 4))) // Add broader area match
                         .ToList();
                     
-                    // Then do exact distance calculation on the smaller set
+                    // Log the number of potential matches
+                    _logger?.LogDebug("Found {Count} potential matches using geohash prefixes", potentialMatches.Count);
+                    
+                    // If no matches with geohash, try all stops with increased radius
+                    if (potentialMatches.Count == 0)
+                    {
+                        _logger?.LogWarning("No potential matches found with geohash, using all stops with expanded radius");
+                        potentialMatches = _cachedAllStops;
+                        // Expand search radius by 1.5x to ensure we find something
+                        radiusMeters = (int)(radiusMeters * 1.5);
+                    }
+                    
+                    // Then do exact distance calculation on the filtered set
                     var nearbyStops = new List<TransportStop>();
                     foreach (var stop in potentialMatches)
                     {
@@ -1240,25 +1267,35 @@ namespace hk_realtime_transport_info_maui.Services
                         }
                     }
                     
+                    _logger?.LogInformation("In-memory search found {Count} stops within {Radius}m of location {Lat}, {Lon}", 
+                        nearbyStops.Count, radiusMeters, latitude, longitude);
+                    
                     // Sort by distance
                     return nearbyStops.OrderBy(s => s.DistanceFromUser).ToList();
                 }
                 
                 // Fall back to database query if cache is not available
+                _logger?.LogDebug("No cached stops available, using database query");
                 var db = GetDatabase();
                 var stopCollection = db.GetCollection<TransportStop>("TransportStops");
+                
+                // Increase the search radius slightly to ensure we find stops
+                int expandedRadius = (int)(radiusMeters * 1.2);
                 
                 // Step 1: Convert radius to degrees (approximate)
                 // 1 degree of latitude = ~111,000 meters
                 // 1 degree of longitude = ~111,000 meters * cos(latitude)
-                double latDegrees = radiusMeters / 111000.0;
-                double longDegrees = radiusMeters / (111000.0 * Math.Cos(latitude * Math.PI / 180));
+                double latDegrees = expandedRadius / 111000.0;
+                double longDegrees = expandedRadius / (111000.0 * Math.Cos(latitude * Math.PI / 180));
                 
                 // Step 2: Create a bounding box
                 double minLat = latitude - latDegrees;
                 double maxLat = latitude + latDegrees;
                 double minLong = longitude - longDegrees;
                 double maxLong = longitude + longDegrees;
+                
+                _logger?.LogDebug("Searching database with bounding box: minLat={MinLat}, maxLat={MaxLat}, minLong={MinLong}, maxLong={MaxLong}",
+                    minLat, maxLat, minLong, maxLong);
                 
                 // Step 3: Find stops within the bounding box
                 var stops = stopCollection.Find(Query.And(
@@ -1267,6 +1304,8 @@ namespace hk_realtime_transport_info_maui.Services
                     Query.GTE("Longitude", minLong),
                     Query.LTE("Longitude", maxLong)
                 )).ToList();
+                
+                _logger?.LogDebug("Found {Count} stops within bounding box", stops.Count);
                 
                 // Step 4: Filter further to ensure they're within the radius
                 var result = new List<TransportStop>();
@@ -1278,6 +1317,37 @@ namespace hk_realtime_transport_info_maui.Services
                         stop.DistanceFromUser = distance;
                         result.Add(stop);
                     }
+                }
+                
+                _logger?.LogInformation("Database query found {Count} stops within {Radius}m of location {Lat}, {Lon}", 
+                    result.Count, radiusMeters, latitude, longitude);
+                
+                // If we still didn't find any stops, try loading all stops as a last resort
+                if (result.Count == 0)
+                {
+                    _logger?.LogWarning("No stops found in database for location {Lat}, {Lon}, expanding search", latitude, longitude);
+                    
+                    // Try to load all stops and manually filter
+                    if (_cachedAllStops == null || _cachedAllStops.Count == 0)
+                    {
+                        _cachedAllStops = stopCollection.FindAll().ToList();
+                    }
+                    
+                    // Use an even larger radius as last resort
+                    int lastResortRadius = (int)(radiusMeters * 2);
+                    
+                    foreach (var stop in _cachedAllStops)
+                    {
+                        double distance = CalculateDistanceInMeters(latitude, longitude, stop.Latitude, stop.Longitude);
+                        if (distance <= lastResortRadius)
+                        {
+                            stop.DistanceFromUser = distance;
+                            result.Add(stop);
+                        }
+                    }
+                    
+                    _logger?.LogInformation("Last resort full search found {Count} stops within {Radius}m", 
+                        result.Count, lastResortRadius);
                 }
                 
                 // Step 5: Sort by distance
@@ -1315,6 +1385,40 @@ namespace hk_realtime_transport_info_maui.Services
         {
             _cachedAllStops = null;
             _logger?.LogInformation("Cleared stop cache");
+        }
+        
+        /// <summary>
+        /// Delete a record from the database by its ID
+        /// </summary>
+        /// <typeparam name="T">Type of record to delete</typeparam>
+        /// <param name="collectionName">Name of the collection</param>
+        /// <param name="id">ID of the record to delete</param>
+        /// <returns>True if deletion was successful, false otherwise</returns>
+        public bool DeleteRecord<T>(string collectionName, string id) where T : class
+        {
+            try
+            {
+                var db = GetDatabase();
+                var collection = db.GetCollection<T>(collectionName);
+                return collection.Delete(id);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, $"Error deleting record from {collectionName}");
+                return false;
+            }
+        }
+        
+        /// <summary>
+        /// Asynchronously delete a record from the database by its ID
+        /// </summary>
+        /// <typeparam name="T">Type of record to delete</typeparam>
+        /// <param name="collectionName">Name of the collection</param>
+        /// <param name="id">ID of the record to delete</param>
+        /// <returns>True if deletion was successful, false otherwise</returns>
+        public async Task<bool> DeleteRecordAsync<T>(string collectionName, string id) where T : class
+        {
+            return await Task.Run(() => DeleteRecord<T>(collectionName, id));
         }
     }
 } 

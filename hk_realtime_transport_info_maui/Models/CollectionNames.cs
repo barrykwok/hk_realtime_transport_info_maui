@@ -12,5 +12,6 @@ namespace hk_realtime_transport_info_maui.Models
         public const string HOLIDAYS = "Holiday";
         public const string ROUTE_STOPS = "RouteStops";
         public const string STOP_OPERATOR_IDS = "StopOperatorIds";
+        public const string CACHED_LOCATIONS = "CachedLocations";
     }
 } 

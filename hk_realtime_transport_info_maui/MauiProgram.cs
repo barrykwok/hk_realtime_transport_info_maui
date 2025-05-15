@@ -108,6 +108,15 @@ public static class MauiProgram
 			return new EtaService(httpClient, liteDbService, logger, cacheService);
 		});
 		
+		// Register location cache service
+		builder.Services.AddSingleton<LocationCacheService>(sp =>
+		{
+			var liteDbService = sp.GetRequiredService<LiteDbService>();
+			var logger = sp.GetRequiredService<ILogger<LocationCacheService>>();
+			
+			return new LocationCacheService(liteDbService, logger);
+		});
+		
 		// Register HttpClient for API services
 		builder.Services.AddSingleton<HttpClient>();
 		
@@ -146,7 +155,14 @@ public static class MauiProgram
 		});
 
 		// Register pages
-		builder.Services.AddTransient<MainPage>();
+		builder.Services.AddTransient<MainPage>(sp => {
+			var databaseService = sp.GetRequiredService<LiteDbService>();
+			var kmbDataService = sp.GetRequiredService<KmbDataService>();
+			var etaService = sp.GetRequiredService<EtaService>();
+			var logger = sp.GetRequiredService<ILogger<MainPage>>();
+			var locationCacheService = sp.GetRequiredService<LocationCacheService>();
+			return new MainPage(databaseService, kmbDataService, etaService, logger, locationCacheService);
+		});
 		builder.Services.AddTransient<RouteDetailsPage>();
 
 		// Register background service for database maintenance
