@@ -776,6 +776,10 @@ public partial class MainPage : ContentPage
 	private DistanceFilter _previousDistanceFilterForIncrementalUpdate = DistanceFilter.Meters200;
 
 	private readonly SemaphoreSlim _adaptLock = new SemaphoreSlim(1, 1);
+	private bool _isUpdatingEtaDisplay = false;
+	
+	// Timer for ETA display text updates (updates display without fetching new ETAs)
+	private IDispatcherTimer? _etaDisplayUpdateTimer;
 
 	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
@@ -929,8 +933,11 @@ public partial class MainPage : ContentPage
 			await UpdateUserLocationIfNeeded();
 		}
 		
-		// Start location update timer
-		StartLocationUpdateTimer();
+			// Start location update timer
+	StartLocationUpdateTimer();
+	
+	// Start the ETA display update timer
+	StartEtaDisplayUpdateTimer();
 	}
 	
 	protected override void OnDisappearing()
@@ -950,12 +957,19 @@ public partial class MainPage : ContentPage
 				}
 			}
 			
-			// Stop the location update timer
-			if (_locationUpdateTimer != null && _locationUpdateTimer.IsRunning)
-			{
-				_locationUpdateTimer.Stop();
-				_logger?.LogDebug("Stopped location update timer");
-			}
+					// Stop the location update timer
+		if (_locationUpdateTimer != null && _locationUpdateTimer.IsRunning)
+		{
+			_locationUpdateTimer.Stop();
+			_logger?.LogDebug("Stopped location update timer");
+		}
+		
+		// Stop the ETA display update timer
+		if (_etaDisplayUpdateTimer != null && _etaDisplayUpdateTimer.IsRunning)
+		{
+			_etaDisplayUpdateTimer.Stop();
+			_logger?.LogDebug("Stopped ETA display update timer");
+		}
 			
 			// Remove scroll handler
 			if (this.FindByName<CollectionView>("RoutesCollection") is CollectionView collectionView)
@@ -3593,6 +3607,161 @@ public partial class MainPage : ContentPage
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Error in location timer tick handler");
+		}
+	}
+	
+	/// <summary>
+	/// Starts the timer for updating ETA display text without refetching data
+	/// </summary>
+	private void StartEtaDisplayUpdateTimer()
+	{
+		try
+		{
+			// Create a timer if it doesn't exist
+			if (_etaDisplayUpdateTimer == null)
+			{
+				_etaDisplayUpdateTimer = Dispatcher.CreateTimer();
+				_etaDisplayUpdateTimer.Interval = TimeSpan.FromSeconds(15); // 15 seconds refresh
+				_etaDisplayUpdateTimer.Tick += EtaDisplayUpdateTimer_Tick;
+				
+				_logger?.LogInformation("Created ETA display update timer with interval {0} seconds", _etaDisplayUpdateTimer.Interval.TotalSeconds);
+			}
+			
+			// Start the timer if it exists and is not running
+			if (_etaDisplayUpdateTimer != null && !_etaDisplayUpdateTimer.IsRunning)
+			{
+				// Delay the first execution to avoid UI freezes during initial load
+				Task.Delay(2000).ContinueWith(_ => {
+					MainThread.BeginInvokeOnMainThread(() => {
+						if (_etaDisplayUpdateTimer != null && !_etaDisplayUpdateTimer.IsRunning)
+						{
+							_etaDisplayUpdateTimer.Start();
+							_logger?.LogInformation("Started ETA display update timer");
+						}
+					});
+				});
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error starting ETA display update timer");
+		}
+	}
+	
+	/// <summary>
+	/// Timer tick handler for updating ETA display text without fetching new data
+	/// </summary>
+	private void EtaDisplayUpdateTimer_Tick(object? sender, EventArgs e)
+	{
+		try
+		{
+			// Skip if another ETA update is already in progress
+			if (_isUpdatingEtas || _isUpdatingEtaDisplay)
+			{
+				return;
+			}
+			
+			_isUpdatingEtaDisplay = true;
+			
+			// Run on a background thread to avoid blocking UI
+			Task.Run(async () => {
+				try
+				{
+					await UpdateEtaDisplayText();
+				}
+				finally
+				{
+					_isUpdatingEtaDisplay = false;
+				}
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error in ETA display update timer tick");
+			_isUpdatingEtaDisplay = false;
+		}
+	}
+	
+	/// <summary>
+	/// Updates the ETA display text based on current time without making API calls
+	/// </summary>
+	private async Task UpdateEtaDisplayText()
+	{
+		try
+		{
+			// Only process if we're showing nearby routes (distance filter)
+			if (_currentDistanceFilter == DistanceFilter.All || Routes == null)
+			{
+				return;
+			}
+			
+			bool anyUpdates = false;
+			
+			// Get all visible stop groups
+			var stopGroups = Routes.OfType<StopGroup>().ToList();
+			if (!stopGroups.Any())
+			{
+				return;
+			}
+			
+			// Current time to compare against
+			DateTime now = DateTime.Now;
+			
+			// Process each stop group and its routes
+			foreach (var stopGroup in stopGroups)
+			{
+				if (stopGroup.Routes == null) continue;
+				
+				foreach (var route in stopGroup.Routes)
+				{
+					if (!route.HasEta || route.NextEta == null) continue;
+					
+					// Calculate new display text based on current time
+					string oldDisplayText = route.FirstEta;
+					
+					// Update the display text based on current time
+					if (route.NextEta.EtaTime != DateTime.MinValue)
+					{
+						TimeSpan timeDiff = route.NextEta.EtaTime - now;
+						
+						// Generate new display text
+						string newDisplayText;
+						
+						if (timeDiff.TotalMinutes <= 0)
+						{
+							// Bus has already arrived or passed
+							newDisplayText = "Arrived";
+						}
+						else if (timeDiff.TotalMinutes < 1)
+						{
+							// Less than a minute away
+							newDisplayText = "Arriving";
+						}
+						else
+						{
+							int minutes = (int)Math.Floor(timeDiff.TotalMinutes);
+							newDisplayText = $"{minutes} min";
+						}
+						
+						// Only update if text has changed
+						if (newDisplayText != oldDisplayText)
+						{
+							route.FirstEta = newDisplayText;
+							anyUpdates = true;
+						}
+					}
+				}
+			}
+			
+			// If any updates were made, log it
+			if (anyUpdates)
+			{
+				_logger?.LogDebug("Updated ETA display text for routes without fetching new data");
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error updating ETA display text");
 		}
 	}
 

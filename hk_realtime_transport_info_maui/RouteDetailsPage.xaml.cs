@@ -32,6 +32,10 @@ public partial class RouteDetailsPage : ContentPage
     private bool _isGpsRefreshActive;
     private CancellationTokenSource? _gpsRefreshCts;
     private bool _hasTwoDirections;
+    
+    // Timer for ETA display text updates (without fetching new ETAs)
+    private IDispatcherTimer? _etaDisplayUpdateTimer;
+    private bool _isUpdatingEtaDisplay = false;
 
     public ICommand RefreshCommand { get; }
     public ICommand ShowNearestStopCommand { get; private set; }
@@ -177,6 +181,9 @@ public partial class RouteDetailsPage : ContentPage
         
         // Initialize GPS refresh timer
         InitializeGpsRefreshTimer();
+        
+        // Initialize ETA display update timer
+        InitializeEtaDisplayUpdateTimer();
         
         // Log for debugging the ReverseRouteButton
         _logger?.LogDebug("ReverseRouteButton initialized: {isNull}", ReverseRouteButton == null);
@@ -828,6 +835,9 @@ public partial class RouteDetailsPage : ContentPage
             
             // Start GPS refresh timer when page appears
             StartGpsRefreshTimer();
+            
+            // Start ETA display update timer
+            StartEtaDisplayUpdateTimer();
         }
         catch (Exception ex)
         {
@@ -1463,6 +1473,9 @@ public partial class RouteDetailsPage : ContentPage
             // Stop GPS refresh timer
             StopGpsRefreshTimer();
             
+            // Stop ETA display update timer
+            StopEtaDisplayUpdateTimer();
+            
             // Clean up WebView event handlers
             StopsMapView.Navigated -= OnMapNavigated;
             StopsMapView.Navigating -= OnMapNavigating;
@@ -1728,6 +1741,24 @@ public partial class RouteDetailsPage : ContentPage
     }
     
     /// <summary>
+    /// Initialize the ETA display update timer that runs every 15 seconds
+    /// </summary>
+    private void InitializeEtaDisplayUpdateTimer()
+    {
+        _etaDisplayUpdateTimer = Application.Current?.Dispatcher?.CreateTimer();
+        if (_etaDisplayUpdateTimer != null)
+        {
+            _etaDisplayUpdateTimer.Interval = TimeSpan.FromSeconds(15);
+            _etaDisplayUpdateTimer.Tick += OnEtaDisplayUpdateTimerTick;
+            _logger?.LogDebug("ETA display update timer initialized");
+        }
+        else
+        {
+            _logger?.LogWarning("Could not create ETA display update timer");
+        }
+    }
+    
+    /// <summary>
     /// Handle the GPS refresh timer tick event
     /// </summary>
     private void OnGpsRefreshTimerTick(object? sender, EventArgs e)
@@ -1792,6 +1823,139 @@ public partial class RouteDetailsPage : ContentPage
             
             // Cancel any ongoing GPS refresh operation
             _gpsRefreshCts?.Cancel();
+        }
+    }
+    
+    /// <summary>
+    /// Start ETA display update timer
+    /// </summary>
+    private void StartEtaDisplayUpdateTimer()
+    {
+        if (_etaDisplayUpdateTimer != null && !_etaDisplayUpdateTimer.IsRunning)
+        {
+            _etaDisplayUpdateTimer.Start();
+            _logger?.LogDebug("ETA display update timer started");
+        }
+    }
+    
+    /// <summary>
+    /// Stop ETA display update timer
+    /// </summary>
+    private void StopEtaDisplayUpdateTimer()
+    {
+        if (_etaDisplayUpdateTimer != null && _etaDisplayUpdateTimer.IsRunning)
+        {
+            _etaDisplayUpdateTimer.Stop();
+            _logger?.LogDebug("ETA display update timer stopped");
+        }
+    }
+    
+    /// <summary>
+    /// Handle the ETA display update timer tick event
+    /// </summary>
+    private void OnEtaDisplayUpdateTimerTick(object? sender, EventArgs e)
+    {
+        try
+        {
+            // Skip if ETA update is already in progress
+            if (_isLoadingEta || _isUpdatingEtaDisplay)
+            {
+                return;
+            }
+            
+            _isUpdatingEtaDisplay = true;
+            
+            // Run on a background thread to avoid blocking UI
+            Task.Run(async () => {
+                try
+                {
+                    await UpdateEtaDisplayText();
+                }
+                finally
+                {
+                    _isUpdatingEtaDisplay = false;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Error in ETA display update timer tick");
+            _isUpdatingEtaDisplay = false;
+        }
+    }
+    
+    /// <summary>
+    /// Updates the ETA display text based on current time without making API calls
+    /// </summary>
+    private async Task UpdateEtaDisplayText()
+    {
+        try
+        {
+            // Only process if we have stops loaded
+            if (Stops == null || Stops.Count == 0 || _etaData.Count == 0)
+            {
+                return;
+            }
+            
+            bool anyUpdates = false;
+            
+            // Current time to compare against
+            DateTime now = DateTime.Now;
+            
+            // Process each stop with updated ETA display
+            foreach (var stop in Stops)
+            {
+                if (stop == null || !_etaData.ContainsKey(stop.Id)) continue;
+                
+                var stopEtas = _etaData[stop.Id];
+                if (stopEtas == null || !stopEtas.Any()) continue;
+                
+                // Get the earliest ETA
+                var earliestEta = stopEtas.OrderBy(e => e.EtaTime).FirstOrDefault();
+                if (earliestEta == null || earliestEta.EtaTime == DateTime.MinValue) continue;
+                
+                // Calculate new display text based on current time
+                string oldDisplayText = stop.FirstEta;
+                
+                // Update the display text based on current time
+                TimeSpan timeDiff = earliestEta.EtaTime - now;
+                
+                // Generate new display text
+                string newDisplayText;
+                
+                if (timeDiff.TotalMinutes <= 0)
+                {
+                    // Bus has already arrived or passed
+                    newDisplayText = "Arrived";
+                }
+                else if (timeDiff.TotalMinutes < 1)
+                {
+                    // Less than a minute away
+                    newDisplayText = "Arriving";
+                }
+                else
+                {
+                    int minutes = (int)Math.Floor(timeDiff.TotalMinutes);
+                    newDisplayText = $"{minutes} min";
+                }
+                
+                // Only update if text has changed
+                if (newDisplayText != oldDisplayText)
+                {
+                    stop.FirstEta = newDisplayText;
+                    anyUpdates = true;
+                }
+            }
+            
+            // If any updates were made, log it
+            if (anyUpdates)
+            {
+                _logger?.LogDebug("Updated ETA display text for route stops without fetching new data");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Error updating ETA display text");
         }
     }
 
