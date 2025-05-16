@@ -18,7 +18,7 @@ namespace hk_realtime_transport_info_maui.Services
 {
     public class EtaService
     {
-        private readonly HttpClient _httpClient;
+        private readonly HttpClientUtility _httpClient;
         private readonly LiteDbService _databaseService;
         private readonly ILogger<EtaService> _logger;
         private readonly string _kmbStopEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/eta";
@@ -78,7 +78,7 @@ namespace hk_realtime_transport_info_maui.Services
         private readonly ConcurrentDictionary<string, Task<List<TransportEta>>> _pendingMtrEtaRequests = 
             new ConcurrentDictionary<string, Task<List<TransportEta>>>();
 
-        public EtaService(HttpClient httpClient, LiteDbService databaseService, ILogger<EtaService> logger, CacheService cacheService)
+        public EtaService(HttpClientUtility httpClient, LiteDbService databaseService, ILogger<EtaService> logger, CacheService cacheService)
         {
             _httpClient = httpClient;
             _databaseService = databaseService;
@@ -153,114 +153,110 @@ namespace hk_realtime_transport_info_maui.Services
                 return cachedEtas;
             }
             
-                try
-                {
-                    string url = $"{_kmbStopEtaBaseUrl}/{stopId}/{routeNumber}/{serviceType}";
-                    _logger?.LogDebug("Fetching KMB stop ETA from: {url}", url);
+            try
+            {
+                string url = $"{_kmbStopEtaBaseUrl}/{stopId}/{routeNumber}/{serviceType}";
+                _logger?.LogDebug("Fetching KMB stop ETA from: {url}", url);
 
-                    // Use cancellation token to avoid hanging requests
-                    using var cts = new CancellationTokenSource();
-                    cts.CancelAfter(TimeSpan.FromSeconds(10)); // 10 second timeout
-                    
-                // Use HTTP client with centralized retry mechanism
-                    var response = await _httpClient.GetAsync(url, cts.Token);
-                    
-                    // Check for specific status codes
-                    if (response.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        _logger?.LogWarning("KMB stop ETA data not found: {stopId}/{routeNumber}/{serviceType}", 
-                            stopId, routeNumber, serviceType);
-                        return new List<TransportEta>();
-                    }
-                    
-                    if (!response.IsSuccessStatusCode)
-                    {
+                // Use the HttpClientUtility with a high priority and default timeout
+                var response = await _httpClient.GetAsync(url, HttpClientUtility.PRIORITY_HIGH);
+                
+                // Check for specific status codes
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    _logger?.LogWarning("KMB stop ETA data not found: {stopId}/{routeNumber}/{serviceType}", 
+                        stopId, routeNumber, serviceType);
+                    return new List<TransportEta>();
+                }
+                
+                if (!response.IsSuccessStatusCode)
+                {
                     _logger?.LogError("Failed to fetch KMB stop ETA data: {statusCode}", response.StatusCode);
-                        return new List<TransportEta>();
-                    }
+                    return new List<TransportEta>();
+                }
 
-                    // Use ReadAsStreamAsync for better performance with large responses
-                    var stream = await response.Content.ReadAsStreamAsync();
+                // Use ReadAsStreamAsync for better performance with large responses
+                var stream = await response.Content.ReadAsStreamAsync();
+                
+                try 
+                {
+                    var etaResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(stream, _jsonOptions);
                     
-                    try 
+                    if (etaResponse?.Data == null || etaResponse.Data.Count == 0)
                     {
-                        var etaResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(stream, _jsonOptions);
-                        
-                        if (etaResponse?.Data == null || etaResponse.Data.Count == 0)
-                        {
-                            _logger?.LogWarning("No ETA data found for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
-                            return new List<TransportEta>();
-                        }
-
-                        var result = new List<TransportEta>(etaResponse.Data.Count); // Pre-size the list
-                        DateTime now = DateTime.Now; // Cache current time
-                        
-                        foreach (var etaData in etaResponse.Data)
-                        {
-                            if (string.IsNullOrEmpty(etaData.Eta)) continue;
-
-                            // Check if the stop ID is valid
-                            if (string.IsNullOrEmpty(etaData.StopId))
-                            {
-                                _logger?.LogWarning("Skipping ETA data with null or empty stop ID for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
-                                continue;
-                            }
-
-                            // First parse the ETA time since we need it for ID generation
-                            if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
-                                    CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
-                            {
-                                _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
-                                continue;
-                            }
-                            
-                            // Restore the correct parameters
-                            string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
-
-                            // Calculate minutes remaining
-                            TimeSpan timeRemaining = etaTime - now;
-                            int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
-                            
-                            var eta = new TransportEta
-                            {
-                                Id = etaId,
-                                StopId = etaData.StopId ?? string.Empty, // Ensure StopId is never null
-                                RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
-                                RouteNumber = etaData.Route ?? string.Empty, // Fix null warning
-                                Direction = etaData.Dir ?? string.Empty, // Fix null warning
-                                ServiceType = serviceType,
-                                FetchTime = now,
-                                Remarks = etaData.Remarks ?? string.Empty, // Ensure Remarks is never null
-                                EtaTime = etaTime,
-                                RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
-                                IsCancelled = !string.IsNullOrEmpty(etaData.Remarks) && 
-                                              etaData.Remarks?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true
-                            };
-
-                            result.Add(eta);
-                        }
-
-                        // Cache the result using our enhanced cache service
-                        _cacheService.Set(cacheKey, result, EtaCacheExpiration);
-                        
-                        _logger?.LogDebug("Successfully fetched and cached {count} ETAs for KMB stop {stopId}", result.Count, stopId);
-                        return result;
-                    }
-                    catch (JsonException ex)
-                    {
-                        _logger?.LogError(ex, "Error deserializing KMB stop ETA response for stop {stopId}", stopId);
+                        _logger?.LogWarning("No ETA data found for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
                         return new List<TransportEta>();
                     }
+
+                    var result = new List<TransportEta>(etaResponse.Data.Count); // Pre-size the list
+                    DateTime now = DateTime.Now; // Cache current time
+                    
+                    foreach (var etaData in etaResponse.Data)
+                    {
+                        if (string.IsNullOrEmpty(etaData.Eta)) continue;
+
+                        // Check if the stop ID is valid
+                        if (string.IsNullOrEmpty(etaData.StopId))
+                        {
+                            _logger?.LogWarning("Skipping ETA data with null or empty stop ID for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
+                            continue;
+                        }
+
+                        // First parse the ETA time since we need it for ID generation
+                        if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
+                                CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
+                        {
+                            _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
+                            continue;
+                        }
+                        
+                        // Restore the correct parameters
+                        string etaId = $"{etaData.Route}_{etaData.StopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
+
+                        // Calculate minutes remaining
+                        TimeSpan timeRemaining = etaTime - now;
+                        int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
+                        
+                        var eta = new TransportEta
+                        {
+                            Id = etaId,
+                            StopId = etaData.StopId ?? string.Empty, // Ensure StopId is never null
+                            RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
+                            RouteNumber = etaData.Route ?? string.Empty, // Fix null warning
+                            Direction = etaData.Dir ?? string.Empty, // Fix null warning
+                            ServiceType = serviceType,
+                            FetchTime = now,
+                            Remarks = etaData.Remarks ?? string.Empty, // Ensure Remarks is never null
+                            EtaTime = etaTime,
+                            RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
+                            IsCancelled = !string.IsNullOrEmpty(etaData.Remarks) && 
+                                        etaData.Remarks?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true
+                        };
+
+                        result.Add(eta);
+                    }
+
+                    // Cache the result using our enhanced cache service
+                    _cacheService.Set(cacheKey, result, EtaCacheExpiration);
+                    
+                    _logger?.LogDebug("Successfully fetched and cached {count} ETAs for KMB stop {stopId}", result.Count, stopId);
+                    return result;
                 }
-                catch (TaskCanceledException ex)
+                catch (JsonException ex)
                 {
+                    _logger?.LogError(ex, "Error deserializing KMB stop ETA response for stop {stopId}", stopId);
+                    return new List<TransportEta>();
+                }
+            }
+            catch (TaskCanceledException ex)
+            {
                 _logger?.LogError(ex, "KMB ETA request timed out for stop {stopId}", stopId);
-                    return new List<TransportEta>();
-                }
-                catch (Exception ex)
-                {
+                return new List<TransportEta>();
+            }
+            catch (Exception ex)
+            {
                 _logger?.LogError(ex, "Error fetching ETA data for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
-                    return new List<TransportEta>();
+                return new List<TransportEta>();
             }
         }
 
@@ -280,21 +276,20 @@ namespace hk_realtime_transport_info_maui.Services
             
             foreach (var request in requests)
             {
-                tasks.Add(Task.Run(async () => 
+                await semaphore.WaitAsync();
+                
+                tasks.Add(Task.Run(async () =>
                 {
                     try
                     {
-                        await semaphore.WaitAsync();
-                        var stopEtas = await FetchEtaForStop(request.stopId, request.routeNumber, request.serviceType);
-                        
-                        if (stopEtas.Count > 0)
-                        {
-                            result[request.stopId] = stopEtas;
-                        }
+                        var etas = await FetchKmbEtaForStop(request.stopId, request.routeNumber, request.serviceType);
+                        result.TryAdd(request.stopId, etas);
                     }
                     catch (Exception ex)
                     {
-                        _logger?.LogError(ex, "Error fetching ETAs for stop {stopId}, route {routeNumber}", request.stopId, request.routeNumber);
+                        _logger?.LogError(ex, "Error fetching ETAs for stop {stopId} route {routeNumber}", 
+                            request.stopId, request.routeNumber);
+                        result.TryAdd(request.stopId, new List<TransportEta>());
                     }
                     finally
                     {
@@ -304,7 +299,6 @@ namespace hk_realtime_transport_info_maui.Services
             }
             
             await Task.WhenAll(tasks);
-            semaphore.Dispose();
             
             return new Dictionary<string, List<TransportEta>>(result);
         }
@@ -326,232 +320,120 @@ namespace hk_realtime_transport_info_maui.Services
             }
             
             var result = new Dictionary<string, List<TransportEta>>();
-            int retryCount = 0;
             
-            // Get all stops for this route from the database for matching when stop IDs are missing
-            var routeStops = _databaseService.GetSortedStopsForRoute(routeId);
-            
-            // Use a ValueDictionary for better performance with value types
-            var stopSequenceMap = new Dictionary<int, string>(routeStops?.Count ?? 0);
-            
-            // Create a mapping of stop sequence to stop ID
-            if (routeStops != null && routeStops.Count > 0)
+            try
             {
-                foreach (var stop in routeStops)
+                string url = $"{_kmbRouteEtaBaseUrl}/{routeNumber}/{serviceType}";
+                _logger?.LogDebug("Fetching all KMB route ETAs from: {url}", url);
+                
+                // Use HttpClientUtility to make the request
+                var response = await _httpClient.GetAsync(url, HttpClientUtility.PRIORITY_HIGH);
+                
+                // Check for specific status codes
+                if (response.StatusCode == HttpStatusCode.NotFound)
                 {
-                    if (!string.IsNullOrEmpty(stop.Id) && stop.Sequence > 0)
+                    _logger?.LogWarning("KMB route ETA data not found: {routeNumber}/{serviceType}", routeNumber, serviceType);
+                    return result;
+                }
+                
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger?.LogError("Failed to fetch KMB route ETA data: {statusCode}", response.StatusCode);
+                    return result;
+                }
+                
+                // Use ReadAsStreamAsync for better performance with large responses
+                var stream = await response.Content.ReadAsStreamAsync();
+                
+                // Try to deserialize the route ETA response
+                var routeEtaResponse = await JsonSerializer.DeserializeAsync<KmbRouteEtaResponse>(stream, _jsonOptions);
+                
+                if (routeEtaResponse?.Data == null || routeEtaResponse.Data.Count == 0)
+                {
+                    _logger?.LogWarning("No ETA data found for KMB route {routeNumber} service type {serviceType}", 
+                        routeNumber, serviceType);
+                    return result;
+                }
+                
+                _logger?.LogInformation("Received {count} ETAs for KMB route {routeNumber} service type {serviceType}", 
+                    routeEtaResponse.Data.Count, routeNumber, serviceType);
+                
+                // Process the ETAs by stop
+                var etasByStop = routeEtaResponse.Data
+                    .GroupBy(eta => eta.StopId)
+                    .ToDictionary(g => g.Key ?? string.Empty, g => g.ToList());
+                
+                // Cache the current time for efficiency
+                DateTime now = DateTime.Now;
+                
+                // Process each group of ETAs for each stop
+                foreach (var stopGroup in etasByStop)
+                {
+                    string stopId = stopGroup.Key;
+                    var etaDataList = stopGroup.Value;
+                    
+                    if (string.IsNullOrEmpty(stopId) || etaDataList.Count == 0) continue;
+                    
+                    // Pre-size the list for performance
+                    var stopEtas = new List<TransportEta>(etaDataList.Count);
+                    
+                    foreach (var etaData in etaDataList)
                     {
-                        stopSequenceMap[stop.Sequence] = stop.Id;
+                        if (string.IsNullOrEmpty(etaData.Eta)) continue;
+                        
+                        // Parse the ETA time
+                        if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
+                                CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
+                        {
+                            _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
+                            continue;
+                        }
+                        
+                        // Generate a unique ID for this ETA
+                        string etaId = $"{etaData.Route}_{stopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
+                        
+                        // Calculate minutes remaining
+                        TimeSpan timeRemaining = etaTime - now;
+                        int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
+                        
+                        var eta = new TransportEta
+                        {
+                            Id = etaId,
+                            StopId = stopId,
+                            RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}",
+                            RouteNumber = etaData.Route ?? string.Empty,
+                            Direction = etaData.Dir ?? string.Empty,
+                            ServiceType = serviceType,
+                            FetchTime = now,
+                            Remarks = etaData.Remarks ?? string.Empty,
+                            EtaTime = etaTime,
+                            RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
+                            IsCancelled = !string.IsNullOrEmpty(etaData.Remarks) && 
+                                        etaData.Remarks?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true
+                        };
+                        
+                        stopEtas.Add(eta);
+                    }
+                    
+                    // Only add to the result if we have valid ETAs
+                    if (stopEtas.Count > 0)
+                    {
+                        result[stopId] = stopEtas;
                     }
                 }
                 
-                _logger?.LogDebug("Created stopSequenceMap with {count} entries for route {routeNumber}", 
-                    stopSequenceMap.Count, routeNumber);
+                // Cache the result
+                _cacheService.Set(cacheKey, result, EtaCacheExpiration);
+                
+                _logger?.LogDebug("Successfully processed and cached ETAs for {count} stops on route {routeNumber}", 
+                    result.Count, routeNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching KMB route ETA data for route {routeNumber}", routeNumber);
             }
             
-            while (true)
-            {
-                try
-                {
-                    string url = $"{_kmbRouteEtaBaseUrl}/{routeNumber}/{serviceType}";
-                    _logger?.LogDebug("Fetching all KMB route ETAs from: {url}", url);
-
-                    // Use cancellation token to avoid hanging requests
-                    using var cts = new CancellationTokenSource();
-                    cts.CancelAfter(TimeSpan.FromSeconds(15)); // 15 second timeout for route data (more stops)
-                    
-                    var response = await _httpClient.GetAsync(url, cts.Token);
-                    
-                    // Check for specific status codes
-                    if (response.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        _logger?.LogWarning("KMB route ETA data not found: {routeNumber}/{serviceType}", routeNumber, serviceType);
-                        return result;
-                    }
-                    
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        if (retryCount < MaxRetryAttempts)
-                        {
-                            retryCount++;
-                            _logger?.LogWarning("Failed to fetch KMB route ETA data (attempt {retryCount}/{maxRetries}): {statusCode}", 
-                                retryCount, MaxRetryAttempts, response.StatusCode);
-                            
-                            await Task.Delay(RetryDelayMilliseconds * retryCount);
-                            continue;
-                        }
-                        
-                        _logger?.LogError("Failed to fetch KMB route ETA data after {attempts} attempts: {statusCode}", 
-                            MaxRetryAttempts, response.StatusCode);
-                        return result;
-                    }
-                    
-                    // Use ReadAsStreamAsync for better performance with large responses
-                    var stream = await response.Content.ReadAsStreamAsync();
-                    
-                    try
-                    {
-                        // Try to deserialize the route ETA response
-                        var routeEtaResponse = await JsonSerializer.DeserializeAsync<KmbRouteEtaResponse>(stream, _jsonOptions);
-                        
-                        if (routeEtaResponse?.Data == null || routeEtaResponse.Data.Count == 0)
-                        {
-                            _logger?.LogWarning("No ETA data found for KMB route {routeNumber} service type {serviceType}", 
-                                routeNumber, serviceType);
-                            return result;
-                        }
-                        
-                        _logger?.LogInformation("Received {count} ETAs for KMB route {routeNumber} service type {serviceType}", 
-                            routeEtaResponse.Data.Count, routeNumber, serviceType);
-                        
-                        // Process the ETAs by stop sequence more efficiently
-                        var etasByStop = routeEtaResponse.Data
-                            .GroupBy(eta => eta.Seq)
-                            .ToDictionary(g => g.Key, g => g.ToList());
-                        
-                        // Cache the current time for efficiency
-                        DateTime now = DateTime.Now;
-                        
-                        // Process each group of ETAs for each stop sequence
-                        foreach (var stopGroup in etasByStop)
-                        {
-                            int seq = stopGroup.Key;
-                            var etaDataList = stopGroup.Value;
-                            
-                            if (etaDataList.Count == 0) continue;
-                            
-                            // Get the first ETA data to extract the stop ID
-                            string stopId = etaDataList[0].StopId ?? string.Empty;
-                            
-                            // If stop ID is null, try to get it from the sequence map
-                            if (string.IsNullOrEmpty(stopId) && stopSequenceMap.TryGetValue(seq, out var mappedStopId))
-                            {
-                                _logger?.LogDebug("Using mapped stop ID {mappedStopId} for sequence {seq} on route {routeNumber}", 
-                                    mappedStopId, seq, routeNumber);
-                                stopId = mappedStopId;
-                            }
-                            
-                            // Skip if the stop ID is still null after trying to map it
-                            if (string.IsNullOrEmpty(stopId))
-                            {
-                                _logger?.LogWarning("Skipping ETA data with null or empty stop ID for KMB route {routeNumber} sequence {seq}", 
-                                    routeNumber, seq);
-                                continue;
-                            }
-                            
-                            // Pre-size the list for performance
-                            var stopEtas = new List<TransportEta>(etaDataList.Count);
-                            
-                            foreach (var etaData in etaDataList)
-                            {
-                                if (string.IsNullOrEmpty(etaData.Eta)) continue;
-                                
-                                // Parse the ETA time
-                                if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
-                                        CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
-                                {
-                                    _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
-                                    continue;
-                                }
-                                
-                                // Use the resolved 'stopId' for constructing etaId to ensure uniqueness
-                                string etaId = $"{etaData.Route}_{stopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
-                                
-                                // Calculate minutes remaining
-                                TimeSpan timeRemaining = etaTime - now;
-                                int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
-                                
-                                var eta = new TransportEta
-                                {
-                                    Id = etaId,
-                                    StopId = stopId,
-                                    RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}", // Restore the correct parameters
-                                    RouteNumber = etaData.Route ?? string.Empty,
-                                    Direction = etaData.Dir ?? string.Empty, // Fix null warning
-                                    ServiceType = serviceType,
-                                    FetchTime = now,
-                                    Remarks = etaData.Remarks ?? string.Empty, // Fix null warning
-                                    EtaTime = etaTime,
-                                    RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
-                                    IsCancelled = !string.IsNullOrEmpty(etaData.Remarks) && 
-                                                etaData.Remarks?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true // Add null-conditional operator
-                                };
-                                
-                                stopEtas.Add(eta);
-                            }
-                            
-                            // Only add to the result if we have valid ETAs
-                            if (stopEtas.Count > 0)
-                            {
-                                // Additional null check before using stopId as dictionary key
-                                if (!string.IsNullOrEmpty(stopId))
-                                {
-                                    result[stopId] = stopEtas;
-                                }
-                                else
-                                {
-                                    _logger?.LogWarning("Skipping adding ETAs with null or empty stop ID for KMB route {routeNumber}", routeNumber);
-                                }
-                            }
-                        }
-                        
-                        // Cache the result using the enhanced cache service
-                        _cacheService.Set(cacheKey, result, EtaCacheExpiration);
-                        
-                        _logger?.LogDebug("Successfully processed and cached ETAs for {count} stops on route {routeNumber}", 
-                            result.Count, routeNumber);
-                        return result;
-                    }
-                    catch (JsonException ex)
-                    {
-                        if (retryCount < MaxRetryAttempts)
-                        {
-                            retryCount++;
-                            _logger?.LogWarning(ex, "Error deserializing KMB route ETA response (attempt {retryCount}/{maxRetries})", 
-                                retryCount, MaxRetryAttempts);
-                            
-                            await Task.Delay(RetryDelayMilliseconds * retryCount);
-                            continue;
-                        }
-                        
-                        _logger?.LogError(ex, "Error deserializing KMB route ETA response after {attempts} attempts", 
-                            MaxRetryAttempts);
-                        return result;
-                    }
-                }
-                catch (TaskCanceledException ex)
-                {
-                    if (retryCount < MaxRetryAttempts)
-                    {
-                        retryCount++;
-                        _logger?.LogWarning(ex, "KMB route ETA request timed out (attempt {retryCount}/{maxRetries})", 
-                            retryCount, MaxRetryAttempts);
-                        
-                        await Task.Delay(RetryDelayMilliseconds * retryCount);
-                        continue;
-                    }
-                    
-                    _logger?.LogError(ex, "KMB route ETA request timed out after {attempts} attempts", 
-                        MaxRetryAttempts);
-                    return result;
-                }
-                catch (Exception ex)
-                {
-                    if (retryCount < MaxRetryAttempts)
-                    {
-                        retryCount++;
-                        _logger?.LogWarning(ex, "Error fetching KMB route ETA data (attempt {retryCount}/{maxRetries})", 
-                            retryCount, MaxRetryAttempts);
-                        
-                        await Task.Delay(RetryDelayMilliseconds * retryCount);
-                        continue;
-                    }
-                    
-                    _logger?.LogError(ex, "Error fetching KMB route ETA data for route {routeNumber} after {attempts} attempts", 
-                        routeNumber, MaxRetryAttempts);
-                    return result;
-                }
-            }
+            return result;
         }
 
         /// <summary>
@@ -641,7 +523,7 @@ namespace hk_realtime_transport_info_maui.Services
             // Try to get from cache first
             if (_cacheService.TryGetValue(cacheKey, out Dictionary<string, List<TransportEta>>? cachedEtas) && cachedEtas != null)
             {
-                _logger?.LogDebug("Retrieved ETAs for MTR route {routeNumber} from cache", routeNumber);
+                _logger?.LogDebug("Retrieved cached ETAs for MTR route {routeNumber}", routeNumber);
                 return cachedEtas;
             }
             
@@ -649,120 +531,108 @@ namespace hk_realtime_transport_info_maui.Services
             
             try
             {
-                // Since MTR API only has one endpoint that returns all data for a route,
-                // we make a single API call and then filter for the stops we need
-                
-                // Get language parameter - MTR API only supports "en" or "zh"
                 string language = GetMtrApiLanguage();
+                _logger?.LogDebug("Using '{language}' language for MTR API based on culture: {culture}", language, CultureInfo.CurrentCulture.Name);
                 
-                // Prepare the POST request for MTR API
-                using var content = new StringContent(
-                    $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}",
-                    Encoding.UTF8,
-                    "application/json");
+                // Construct the request body
+                var requestData = new
+                {
+                    language = language,
+                    routeName = routeNumber
+                };
                 
-                using var cts = new CancellationTokenSource();
-                cts.CancelAfter(TimeSpan.FromSeconds(15)); // 15 second timeout for route data
-                
-                string requestBody = $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}";
+                // Create request content
+                string url = _mtrBusEtaUrl;
                 _logger?.LogDebug("Sending MTR ETA API request for route {routeNumber} to URL: {url} with language: {language} and body: {body}", 
-                    routeNumber, _mtrBusEtaUrl, language, requestBody);
+                    routeNumber, url, language, System.Text.Json.JsonSerializer.Serialize(requestData));
                 
-                // Make the API request
-                var response = await _httpClient.PostAsync(_mtrBusEtaUrl, content, cts.Token);
+                // Use JsonContent to properly format the request
+                var jsonContent = JsonContent.Create(requestData, null, _jsonOptions);
+                
+                // Make the request with the HttpClientUtility
+                var response = await _httpClient.PostAsync(url, jsonContent, HttpClientUtility.PRIORITY_HIGH);
                 
                 if (response.IsSuccessStatusCode)
                 {
-                    // First read the response as a string to inspect it before deserializing
+                    // First read the response as a string to validate it
                     string responseContent = await response.Content.ReadAsStringAsync();
-                    _logger?.LogDebug("MTR API raw response for route {routeNumber}: {content}", routeNumber, responseContent);
                     
                     if (string.IsNullOrEmpty(responseContent) || responseContent.Contains("error"))
                     {
-                        _logger?.LogWarning("MTR API returned error or empty response for route {routeNumber}: {content}", 
-                            routeNumber, responseContent);
+                        _logger?.LogWarning("MTR API returned error or empty response for route {routeNumber}", routeNumber);
                         return result;
                     }
                     
                     // Now deserialize using stream and the JsonSerializer
                     try
                     {
-                        // Convert string back to stream for deserialization
                         using var responseData = new MemoryStream(Encoding.UTF8.GetBytes(responseContent));
                         var mtrResponse = await JsonSerializer.DeserializeAsync<MtrEtaResponse>(responseData, _jsonOptions);
                         
-                        if (mtrResponse?.Data != null && mtrResponse.Data.Count > 0)
+                        if (mtrResponse?.BusStop != null && mtrResponse.BusStop.Count > 0)
                         {
-                            _logger?.LogDebug("MTR ETA API returned data for route {routeNumber}: routeStatus={routeStatus}, stopCount={stopCount}",
-                                routeNumber,
-                                mtrResponse.RouteStatus,
-                                mtrResponse.Data.Count);
-                                    
+                            _logger?.LogDebug("MTR ETA API returned data for route {routeNumber}: routeStatus={routeStatus}, stopCount={stopCount}", 
+                                routeNumber, mtrResponse.RouteStatus, mtrResponse.BusStop.Count);
+                            
                             // Process each stop from our list
                             foreach (var stop in stops)
                             {
-                                // Extract stopId from MTR stop format (e.g., MTR-506-U040)
-                                var parts = stop.Id.Split('-');
-                                if (parts.Length < 3)
+                                // Find the matching stop data from the MTR response
+                                string mtrStopId = stop.Id.Replace("MTR-", "", StringComparison.OrdinalIgnoreCase);
+                                string cleanStopId = routeNumber + "-" + mtrStopId.Split('-').LastOrDefault();
+                                
+                                var matchingStop = mtrResponse.BusStop.FirstOrDefault(s => 
+                                    s.BusStopId == mtrStopId || 
+                                    s.BusStopId == cleanStopId ||
+                                    (s.BusStopId?.Contains(routeNumber) == true && mtrStopId.Contains(s.BusStopId)));
+                                
+                                if (matchingStop != null)
                                 {
-                                    _logger?.LogWarning("Invalid stop ID format: {stopId}", stop.Id);
-                                    continue;
+                                    // Convert to internal format and add to result
+                                    var stopEtas = ConvertMtrEtas(matchingStop, stop.Id, routeNumber);
+                                    if (stopEtas.Count > 0)
+                                    {
+                                        result[stop.Id] = stopEtas;
+                                    }
                                 }
-                                
-                                string stopNumber = parts[1];
-                                string directionPart = parts[2];
-                                // Make sure to trim any non-alphanumeric characters from the busStopId
-                                string stopId = $"{stopNumber}-{directionPart.TrimStart('U', 'D', 'u', 'd')}";
-                                string rawStopId = $"{stopNumber}-{directionPart}";
-                                
-                                _logger?.LogDebug("Looking for stop {rawId} or {cleanId} in MTR API response", rawStopId, stopId);
-                                
-                                // Look for matching stop in API response with different matching strategies
-                                var matchingStop = mtrResponse.Data.FirstOrDefault(s => 
-                                    s.BusStopId == stopId ||
-                                    s.BusStopId == rawStopId ||
-                                    (s.BusStopId?.Contains(stopNumber) == true && (s.BusStopId?.EndsWith(directionPart) == true)));
-                                
-                                if (matchingStop == null)
+                                else
                                 {
-                                    _logger?.LogDebug("No matching stop found in MTR API response for stop {stopId}", stop.Id);
-                                    continue;
-                                }
-                                
-                                // Convert ETAs for this stop
-                                var stopEtas = ConvertMtrEtas(matchingStop, stop.Id, routeNumber);
-                                
-                                // Only add if we have ETAs
-                                if (stopEtas.Count > 0)
-                                {
-                                    result[stop.Id] = stopEtas;
+                                    // No matching stop found
+                                    _logger?.LogWarning("No matching stop found in MTR API response for stop {stopId}", stop.Id);
+                                    result[stop.Id] = new List<TransportEta>();
                                 }
                             }
                             
-                            // Cache the result
-                            _cacheService.Set(cacheKey, result, EtaCacheExpiration);
-                            
-                            _logger?.LogDebug("Successfully processed and cached ETAs for {count} stops on MTR route {routeNumber}", 
-                                result.Count, routeNumber);
+                            // Cache the result if we have any data
+                            if (result.Count > 0)
+                            {
+                                _cacheService.Set(cacheKey, result, EtaCacheExpiration);
+                                _logger?.LogDebug("Cached ETAs for MTR route {routeNumber} ({count} stops)", routeNumber, result.Count);
+                            }
                         }
                         else
                         {
-                            _logger?.LogWarning("MTR ETA API returned null response or empty data for route {routeNumber}", routeNumber);
+                            // Enhanced logging for routes with empty data
+                            _logger?.LogWarning("MTR ETA API returned empty data for route {routeNumber}. Status: {status}, Message: {message}, RouteStatus: {routeStatus}", 
+                                routeNumber, 
+                                mtrResponse?.Status ?? "null", 
+                                mtrResponse?.Message ?? "null",
+                                mtrResponse?.RouteStatus ?? "null");
+                                
+                            // Log the raw response for debugging
+                            _logger?.LogDebug("Raw MTR API response for route {routeNumber}: {response}", 
+                                routeNumber, responseContent);
                         }
                     }
                     catch (JsonException ex)
                     {
-                        _logger?.LogError(ex, "Error deserializing MTR API response: {message}", ex.Message);
-                        _logger?.LogDebug("Problematic JSON: {json}", responseContent);
+                        _logger?.LogError(ex, "Error parsing MTR ETA response for route {routeNumber}", routeNumber);
                     }
                 }
                 else
                 {
-                    _logger?.LogWarning("MTR ETA API returned error status code for route {routeNumber}: {status}", 
+                    _logger?.LogError("MTR ETA API returned error status code for route {routeNumber}: {status}", 
                         routeNumber, response.StatusCode);
-                    
-                    string responseContent = await response.Content.ReadAsStringAsync();
-                    _logger?.LogWarning("MTR ETA API error response content: {content}", responseContent);
                 }
             }
             catch (Exception ex)
@@ -879,87 +749,86 @@ namespace hk_realtime_transport_info_maui.Services
             
             _logger?.LogDebug("Starting FetchAllMtrEtaForStop for stop {stopId}", stopId);
             
-            // Try to get from cache first
-            if (_cacheService.TryGetValue(cacheKey, out List<TransportEta>? cachedEtas) && cachedEtas != null)
+            // If we're already fetching ETAs for this stop, wait for that request
+            if (_pendingMtrEtaRequests.TryGetValue(stopId, out var pendingTask))
             {
-                _logger?.LogDebug("Retrieved all ETAs for MTR stop {stopId} from cache", stopId);
-                return cachedEtas;
+                _logger?.LogDebug("Found pending request for MTR stop {stopId}, waiting for it to complete", stopId);
+                try
+                {
+                    return await pendingTask;
+                }
+                catch
+                {
+                    _logger?.LogWarning("Previous request for MTR stop {stopId} failed, will try again", stopId);
+                    _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                }
             }
             
-            // If we recently determined this stop has no ETAs, return empty list quickly
-            if (_mtrStopHasNoEtas.ContainsKey(stopId))
+            // If we recently determined this stop has no ETAs, return quickly
+            if (_mtrStopHasNoEtas.TryGetValue(stopId, out bool hasNoEtas) && hasNoEtas)
             {
-                _logger?.LogDebug("MTR stop {stopId} previously determined to have no ETAs, returning empty list", stopId);
+                _logger?.LogDebug("Using cached knowledge that MTR stop {stopId} has no ETAs", stopId);
                 return new List<TransportEta>();
             }
             
-            // Check if we already have a pending request for this stop
-            if (_pendingMtrEtaRequests.TryGetValue(stopId, out var pendingTask))
+            // Check cache first
+            if (_cacheService.TryGetValue(cacheKey, out List<TransportEta>? cachedEtas) && cachedEtas != null)
             {
-                _logger?.LogDebug("Reusing pending MTR ETA request for stop {stopId}", stopId);
-                return await pendingTask;
+                _logger?.LogDebug("Retrieved ETAs for MTR stop {stopId} from cache ({count} items)", stopId, cachedEtas.Count);
+                return cachedEtas;
             }
             
+            // Create a task completion source for others to await on
             var tcs = new TaskCompletionSource<List<TransportEta>>();
-            _pendingMtrEtaRequests[stopId] = tcs.Task;
+            if (!_pendingMtrEtaRequests.TryAdd(stopId, tcs.Task))
+            {
+                _logger?.LogWarning("Failed to add pending request for MTR stop {stopId}, another thread may have added it", stopId);
+                if (_pendingMtrEtaRequests.TryGetValue(stopId, out var existingTask))
+                {
+                    return await existingTask;
+                }
+            }
             
             try
             {
-                // Parse the MTR route number and direction from the stop ID
-                // Format: MTR-{routeNumber}-{direction}{sequence}
-                // Example: MTR-506-U040 where 506 is the route number, U means upbound, 040 is the sequence
-                
-                var parts = stopId.Split('-');
+                // Extract parts from the stop ID for API request
+                string[] parts = stopId.Split('-');
                 if (parts.Length < 3)
                 {
                     _logger?.LogWarning("Invalid MTR stop ID format: {stopId}", stopId);
-                    tcs.SetResult(new List<TransportEta>());
+                    var emptyList = new List<TransportEta>();
+                    tcs.SetResult(emptyList);
                     _pendingMtrEtaRequests.TryRemove(stopId, out _);
-                    return new List<TransportEta>();
+                    return emptyList;
                 }
                 
                 string routeNumber = parts[1];
                 string directionPart = parts[2];
                 string mtrStopId = $"{routeNumber}-{directionPart}";
                 
-                _logger?.LogDebug("Parsed MTR stop ID {stopId}: routeNumber={routeNumber}, directionPart={directionPart}, mtrStopId={mtrStopId}", 
-                    stopId, routeNumber, directionPart, mtrStopId);
-                
-                // Get language parameter - MTR API only supports "en" or "zh"
+                // Prepare request body
                 string language = GetMtrApiLanguage();
+                var requestData = new
+                {
+                    language = language,
+                    routeName = routeNumber
+                };
                 
-                // Prepare the POST request for MTR API
-                _logger?.LogDebug("Preparing MTR API request for route {routeNumber} with language: {language}", 
-                    routeNumber, language);
+                // Create request content
+                var jsonContent = JsonContent.Create(requestData, null, _jsonOptions);
                 
-                using var content = new StringContent(
-                    $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}",
-                    Encoding.UTF8,
-                    "application/json");
-                
-                using var cts = new CancellationTokenSource();
-                cts.CancelAfter(TimeSpan.FromSeconds(10)); // 10 second timeout
-                
-                string requestBody = $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}";
-                _logger?.LogInformation("Sending MTR ETA API request for route {routeNumber} at stop {stopId} to URL: {url} with body: {requestBody}", 
-                    routeNumber, stopId, _mtrBusEtaUrl, requestBody);
-                
-                // Make the API request using centralized retry mechanism
-                var response = await _httpClient.PostAsync(_mtrBusEtaUrl, content, cts.Token);
-                
-                _logger?.LogInformation("Received MTR API response for stop {stopId}, status: {statusCode}", 
-                    stopId, response.StatusCode);
+                // Make request
+                var response = await _httpClient.PostAsync(_mtrBusEtaUrl, jsonContent, HttpClientUtility.PRIORITY_HIGH);
                 
                 if (response.IsSuccessStatusCode)
                 {
-                    // First read the response as a string to inspect it before deserializing
+                    // First read the response as a string to validate it
                     string responseContent = await response.Content.ReadAsStringAsync();
-                    _logger?.LogDebug("MTR API raw response for stop {stopId}: {content}", stopId, responseContent);
                     
                     if (string.IsNullOrEmpty(responseContent) || responseContent.Contains("error"))
                     {
-                        _logger?.LogWarning("MTR API returned error or empty response for stop {stopId}: {content}", 
-                            stopId, responseContent);
+                        _logger?.LogWarning("MTR API returned error or empty response for stop {stopId}", 
+                            stopId);
                         var emptyList = new List<TransportEta>();
                         _mtrStopHasNoEtas[stopId] = true;
                         tcs.SetResult(emptyList);
@@ -974,18 +843,18 @@ namespace hk_realtime_transport_info_maui.Services
                         using var responseData = new MemoryStream(Encoding.UTF8.GetBytes(responseContent));
                         var mtrResponse = await JsonSerializer.DeserializeAsync<MtrEtaResponse>(responseData, _jsonOptions);
                         
-                        if (mtrResponse?.Data != null && mtrResponse.Data.Count > 0)
+                        if (mtrResponse?.BusStop != null && mtrResponse.BusStop.Count > 0)
                         {
                             _logger?.LogInformation("MTR ETA API returned data for stop {stopId}: route={route}, stopCount={stopCount}",
                                 stopId, 
                                 mtrResponse.RouteName,
-                                mtrResponse.Data.Count);
+                                mtrResponse.BusStop.Count);
                                 
                             // Make a more flexible search for matching stops - try both the raw format and a simpler format
                             string cleanStopId = $"{routeNumber}-{directionPart.TrimStart('U', 'D', 'u', 'd')}";
                             
                             // Find the matching stop data with various matching strategies
-                            var matchingStop = mtrResponse.Data.FirstOrDefault(s => 
+                            var matchingStop = mtrResponse.BusStop.FirstOrDefault(s => 
                                 s.BusStopId == mtrStopId || 
                                 s.BusStopId == cleanStopId ||
                                 (s.BusStopId?.Contains(routeNumber) == true && 
@@ -998,7 +867,7 @@ namespace hk_realtime_transport_info_maui.Services
                                     mtrStopId, cleanStopId);
                                 
                                 // Log all available stops from the response to help debug
-                                foreach (var dataStop in mtrResponse.Data)
+                                foreach (var dataStop in mtrResponse.BusStop)
                                 {
                                     _logger?.LogDebug("Available stop in response: {busStopId}", dataStop.BusStopId);
                                 }
@@ -1046,7 +915,6 @@ namespace hk_realtime_transport_info_maui.Services
                     catch (JsonException ex)
                     {
                         _logger?.LogError(ex, "Error deserializing MTR API response: {message}", ex.Message);
-                        _logger?.LogDebug("Problematic JSON: {json}", responseContent);
                         
                         var emptyList = new List<TransportEta>();
                         tcs.SetException(ex);
@@ -1058,9 +926,6 @@ namespace hk_realtime_transport_info_maui.Services
                 {
                     _logger?.LogWarning("MTR ETA API returned error status code for stop {stopId}: {status}", 
                         stopId, response.StatusCode);
-                    
-                    string responseContent = await response.Content.ReadAsStringAsync();
-                    _logger?.LogWarning("MTR ETA API error response content: {content}", responseContent);
                     
                     var emptyList = new List<TransportEta>();
                     
@@ -1222,144 +1087,55 @@ namespace hk_realtime_transport_info_maui.Services
             
             // If we recently determined this stop has no ETAs, return empty list quickly
             if (_stopHasNoEtas.ContainsKey(stopId))
+            {
+                _logger?.LogDebug("Using cached knowledge that stop {stopId} has no ETAs", stopId);
+                return new List<TransportEta>();
+            }
+            
+            try
+            {
+                string url = $"{_kmbStopSpecificEtaBaseUrl}/{stopId}";
+                _logger?.LogDebug("Fetching all KMB ETAs for stop {stopId} from URL: {url}", stopId, url);
+                
+                // Use HttpClientUtility to make the request
+                var response = await _httpClient.GetAsync(url, HttpClientUtility.PRIORITY_HIGH);
+                
+                if (!response.IsSuccessStatusCode)
                 {
-                _logger?.LogDebug("Stop {stopId} previously determined to have no ETAs, returning empty list from quick check.", stopId);
+                    _logger?.LogWarning("Failed to get ETAs for KMB stop {stopId}: {statusCode}", 
+                        stopId, response.StatusCode);
                     return new List<TransportEta>();
                 }
                 
-                int retryCount = 0;
-            string url = string.Empty; // Declare url outside the try block
-                while (true)
+                var stream = await response.Content.ReadAsStreamAsync();
+                var etaResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(stream, _jsonOptions);
+                
+                if (etaResponse?.Data == null || etaResponse.Data.Count == 0)
                 {
-                    try
-                    {
-                    // await ApplyRateLimiting(); // Rate limiting handled by HttpClientUtility
-
-                    // Modify StopId for KMB API if needed
-                    string kmbApiStopId = stopId.StartsWith("KMB_") ? stopId.Substring(4) : stopId;
-                    url = $"{_kmbStopSpecificEtaBaseUrl}/{kmbApiStopId}"; // Assign value here
-                    _logger?.LogDebug("Fetching all KMB ETAs for stop from: {url} (original stopId: {originalStopId})", url, stopId);
-
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); // 10-second timeout
-                    var response = await _httpClient.GetAsync(url, cts.Token);
-                        
-                        if (!response.IsSuccessStatusCode)
-                        {
-                        // Log the initial failure
-                        _logger?.LogWarning("[EtaService] KMB ETA API call for stop {kmbStopId} failed. Status: {statusCode}, URL: {apiUrl}",
-                            stopId, response.StatusCode, url);
-                                
-                        if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
-                        {
-                            // For 422, typically means bad request (e.g. invalid stopId).
-                            // Attempt one immediate retry, just in case of a very transient issue.
-                            if (retryCount < 1) // Max 1 retry for 422 (total 2 attempts)
-                            {
-                                retryCount++;
-                                _logger?.LogInformation("[EtaService] UnprocessableEntity (422) for stop {kmbStopId}. Attempting 1 quick retry ({retryAttempt}/1). URL: {apiUrl}",
-                                    stopId, retryCount, url);
-                                // Optional: await Task.Delay(200); // Very short delay if desired
-                                continue;
-                            }
-                            _logger?.LogWarning("[EtaService] Persistent UnprocessableEntity (422) for stop {kmbStopId} after {retries} attempts. Giving up. URL: {apiUrl}",
-                                stopId, retryCount + 1, url);
-                            // Cache empty result effectively happens when we return new List<TransportEta>() 
-                            // and the caller (e.g., GetCachedEtas) caches it.
-                            return new List<TransportEta>();
-                        }
-                        else if ((int)response.StatusCode >= 500 && (int)response.StatusCode < 600) // Server-side errors (5xx)
-                        {
-                            const int maxServerRetries = 2;
-                            if (retryCount < maxServerRetries) 
-                            {
-                                retryCount++;
-                                _logger?.LogInformation("[EtaService] Server error {statusCode} for stop {kmbStopId}. Retrying (Attempt {retryAttempt}/{maxRetries}). URL: {apiUrl}",
-                                    response.StatusCode, stopId, retryCount, maxServerRetries, url);
-                                await Task.Delay(retryCount * RetryDelayMilliseconds); // Standard delay
-                                continue;
-                            }
-                            _logger?.LogError("[EtaService] Persistent server error {statusCode} for stop {kmbStopId} after {retries} attempts. Giving up. URL: {apiUrl}",
-                                response.StatusCode, stopId, retryCount + 1, url);
-                            return new List<TransportEta>();
-                        }
-                        else // Other client errors (4xx, excluding 422 handled above) or unexpected status codes
-                        {
-                            _logger?.LogWarning("[EtaService] Client error {statusCode} (non-422/5xx) for stop {kmbStopId}. Not retrying. URL: {apiUrl}",
-                                response.StatusCode, stopId, url);
-                            return new List<TransportEta>();
-                        }
-                    }
-                    
-                    // If successful, reset retryCount (though typically we return shortly after success)
-                    // retryCount = 0; 
-                        
-                        // Read the response as JSON
-                        var responseData = await response.Content.ReadAsStreamAsync();
-                        var kmbResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(responseData, _jsonOptions);
-                        
-                        if (kmbResponse?.Data == null)
-                        {
-                        _logger?.LogWarning("KMB ETA API returned null response or data for stop {kmbStopId} (URL: {apiUrl})", stopId, url);
-                        _stopHasNoEtas[stopId] = true;
-                        var emptyList = new List<TransportEta>();
-                        return emptyList;
-                        }
-                        
-                        _logger?.LogDebug("Processing ETAs for KMB stop {kmbStopId} with auto-assignment of stop ID for ETAs with empty stop ID", stopId);
-                        
-                    // Convert to internal format
-                    var result = ConvertKmbEtas(kmbResponse, stopId); // Pass only kmbResponse and stopId
-                    
-                    // Cache the results - use a shorter expiration for stops with no ETAs
-                    TimeSpan cacheExpiry = result.Count > 0 ? TimeSpan.FromSeconds(25) : TimeSpan.FromSeconds(15);
-                    _cacheService.Set(cacheKey, result, cacheExpiry);
-                        
-                    // Record if this stop has ETAs
-                    _stopHasNoEtas[stopId] = result.Count == 0;
-                        
-                    // Complete the task
-                        return result;
-                    }
-                    catch (HttpRequestException ex)
-                    {
-                    // Handle HTTP request errors
-                    _logger?.LogError(ex, "HTTP request error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
-                        stopId, ex.Message, url);
-                        return new List<TransportEta>();
-                    }
-                    catch (JsonException ex)
-                    {
-                    // Handle JSON deserialization errors
-                    _logger?.LogError(ex, "JSON deserialization error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
-                        stopId, ex.Message, url);
-                    if (retryCount < 2) // Allow retry for transient parsing issues if any
-                    {
-                        retryCount++;
-                        await Task.Delay(RetryDelayMilliseconds * retryCount); // Exponential backoff
-                        continue; 
-                    }
-                        return new List<TransportEta>();
-                    }
-                    catch (TaskCanceledException ex)
-                    {
-                    // Handle task cancellation (timeout)
-                    _logger?.LogWarning(ex, "Task canceled (timeout) fetching ETAs for KMB stop {kmbStopId} (URL: {apiUrl})", 
-                        stopId, url);
-                    if (retryCount < 2) // Allow retry for timeout
-                    {
-                        retryCount++;
-                        await Task.Delay(RetryDelayMilliseconds * retryCount); // Exponential backoff
-                        continue;
-                    }
-                        return new List<TransportEta>();
-                    }
-                    catch (Exception ex)
-                    {
-                        // Handle all other errors
-                    _logger?.LogError(ex, "Unexpected error fetching ETAs for KMB stop {kmbStopId}: {message} (URL: {apiUrl})", 
-                        stopId, ex.Message, url);
-                        return new List<TransportEta>();
+                    _logger?.LogWarning("No ETAs found for KMB stop {stopId}", stopId);
+                    _stopHasNoEtas[stopId] = true;
+                    return new List<TransportEta>();
                 }
+                
+                var result = ConvertKmbEtas(etaResponse, stopId);
+                
+                if (result.Count > 0)
+                {
+                    _cacheService.Set(cacheKey, result, EtaCacheExpiration);
+                    _logger?.LogDebug("Cached {count} ETAs for KMB stop {stopId}", result.Count, stopId);
+                }
+                else
+                {
+                    _stopHasNoEtas[stopId] = true;
+                    _logger?.LogDebug("No valid ETAs for KMB stop {stopId} after filtering", stopId);
+                }
+                
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching all ETAs for KMB stop {stopId}", stopId);
+                return new List<TransportEta>();
             }
         }
 
@@ -1703,8 +1479,11 @@ namespace hk_realtime_transport_info_maui.Services
             [JsonPropertyName("footerRemarks")]
             public string? FooterRemarks { get; set; }
             
-            [JsonPropertyName("data")]
-            public List<MtrStopData>? Data { get; set; }
+            [JsonPropertyName("busStop")]
+            public List<MtrStopData>? BusStop { get; set; }
+            
+            [JsonIgnore]
+            public List<MtrStopData>? Data => BusStop;
         }
         
         public class MtrStopData

@@ -2,6 +2,9 @@
 using hk_realtime_transport_info_maui.Services;
 using System.Globalization;
 using Microsoft.Extensions.Caching.Memory;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Net;
 
 namespace hk_realtime_transport_info_maui;
 
@@ -111,12 +114,12 @@ public static class MauiProgram
 		// Register ETA service
 		builder.Services.AddSingleton<EtaService>(sp => 
 		{
-			var httpClient = sp.GetRequiredService<HttpClient>();
+			var httpClientUtility = sp.GetRequiredService<HttpClientUtility>();
 			var liteDbService = sp.GetRequiredService<LiteDbService>();
 			var logger = sp.GetRequiredService<ILogger<EtaService>>();
 			var cacheService = sp.GetRequiredService<CacheService>();
 			
-			var etaService = new EtaService(httpClient, liteDbService, logger, cacheService);
+			var etaService = new EtaService(httpClientUtility, liteDbService, logger, cacheService);
 			
 			// EtaService now handles language mapping internally
 			logger.LogInformation("Initialized EtaService with culture: {culture}", CultureInfo.CurrentCulture.Name);
@@ -134,7 +137,30 @@ public static class MauiProgram
 		});
 		
 		// Register HttpClient for API services
-		builder.Services.AddSingleton<HttpClient>();
+		builder.Services.AddSingleton<HttpClient>(sp => {
+			// Create a custom message handler with better resilience
+			var handler = new SocketsHttpHandler
+			{
+				PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+				PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+				MaxConnectionsPerServer = 20,
+				EnableMultipleHttp2Connections = true,
+				AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+			};
+			
+			var client = new HttpClient(handler)
+			{
+				Timeout = TimeSpan.FromSeconds(30)
+			};
+			
+			// Add common headers
+			client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+			client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+			client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+			client.DefaultRequestHeaders.ConnectionClose = false; // Keep connections alive
+			
+			return client;
+		});
 		
 		// Register HTTP utilities
 		builder.Services.AddSingleton<HttpClientUtility>(sp => 
