@@ -188,9 +188,21 @@ namespace hk_realtime_transport_info_maui
         {
             if (Math.Abs(DistanceInMeters - newDistanceInMeters) > 1)  // Only update if changed by more than 1 meter
             {
+                // Cache the old formatted text
+                string oldDistanceText = DistanceText;
+                
+                // Update the raw distance value
                 DistanceInMeters = newDistanceInMeters;
-                OnPropertyChanged(nameof(DistanceInMeters));
-                OnPropertyChanged(nameof(DistanceText));
+                
+                // Calculate the new formatted text
+                string newDistanceText = $"{Math.Round(DistanceInMeters)}m";
+                
+                // Only trigger UI updates if the formatted text actually changed
+                if (oldDistanceText != newDistanceText)
+                {
+                    OnPropertyChanged(nameof(DistanceInMeters));
+                    OnPropertyChanged(nameof(DistanceText));
+                }
             }
         }
 

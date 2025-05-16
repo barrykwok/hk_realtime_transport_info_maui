@@ -4054,6 +4054,9 @@ public partial class MainPage : ContentPage
 	{
 		try
 		{
+			// Save current scroll position before updating
+			SaveScrollPosition();
+			
 			// Get all stop groups from the current view
 			var stopGroups = Routes.OfType<StopGroup>().ToList();
 			if (stopGroups.Count == 0)
@@ -4073,10 +4076,18 @@ public partial class MainPage : ContentPage
 					double newDistanceInMeters = Location.CalculateDistance(
 						newLocation, stopLocation, DistanceUnits.Kilometers) * 1000;
 					
-					// Update the stop group's distance
+					// The Stop.UpdateDistance method itself checks if the distance has changed significantly
+					// before triggering PropertyChanged notifications, which helps prevent UI flickering
 					stopGroup.UpdateDistance(newDistanceInMeters);
 				}
 			}
+			
+			// Restore scroll position to prevent jumps
+			MainThread.BeginInvokeOnMainThread(async () => 
+			{
+				await Task.Delay(10); // Small delay to ensure UI has processed updates
+				await RestoreScrollPosition();
+			});
 			
 			_logger?.LogDebug("Finished updating distances for stop groups");
 		}
