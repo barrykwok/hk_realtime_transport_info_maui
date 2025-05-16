@@ -867,9 +867,6 @@ public partial class RouteDetailsPage : ContentPage
                 Stops = new ObservableCollection<TransportStop>(stops);
                 _logger?.LogDebug("Immediately loaded {count} stops for route {id}", stops.Count, Route.Id);
                 
-                // Preload test ETAs for UI binding preview
-                PreloadTestEtas(Stops);
-                
                 // Force UI refresh
                 OnPropertyChanged(nameof(Stops));
                 
@@ -889,30 +886,6 @@ public partial class RouteDetailsPage : ContentPage
         {
             _isLoadingStops = false;
         }
-    }
-    
-    private void PreloadTestEtas(ObservableCollection<TransportStop> stops)
-    {
-        int i = 0;
-        foreach (var stop in stops)
-        {
-            i++;
-            if (i % 3 == 0)
-                stop.FirstEta = "5 mins";
-            else if (i % 3 == 1) 
-                stop.FirstEta = "Arriving";
-            else
-                stop.FirstEta = "10 mins";
-            
-            _logger?.LogDebug("DEBUG: Preloaded test ETA '{eta}' for stop {name}", 
-                stop.FirstEta, stop.LocalizedName);
-        }
-    }
-    
-    // This method is no longer needed and has been kept empty for backward compatibility
-    private void UpdateStopSequences(List<TransportStop> stops)
-    {
-        // The sequences are now handled by RouteStopRelation and set in DatabaseService.GetSortedStopsForRoute
     }
     
     private async Task LoadStopsInBackground()
@@ -1047,11 +1020,23 @@ public partial class RouteDetailsPage : ContentPage
         {
             _logger?.LogDebug("Fetching fresh ETAs from API for route {routeId}", Route.Id);
             
-            // Use the faster new bulk API for KMB routes
-            bool isKmbRoute = Route.RouteNumber.StartsWith("KMB") || 
-                              Route.RouteNumber.All(c => char.IsDigit(c) || c == 'X' || c == 'P' || c == 'A' || c == 'M' || c == 'N');
+            // Check for MTR routes first
+            bool isMtrRoute = Route.Id.StartsWith("MTR_");
             
-            if (isKmbRoute)
+            // Use the faster new bulk API for KMB routes
+            bool isKmbRoute = !isMtrRoute && (Route.RouteNumber.StartsWith("KMB") || 
+                              Route.RouteNumber.All(c => char.IsDigit(c) || c == 'X' || c == 'P' || c == 'A' || c == 'M' || c == 'N'));
+            
+            if (isMtrRoute)
+            {
+                _logger?.LogDebug("Using MTR API for route {routeNumber}", Route.RouteNumber);
+                etaData = await _etaService.FetchEtaForRoute(
+                    Route.Id, 
+                    Route.RouteNumber, 
+                    Route.ServiceType, 
+                    Stops.ToList());
+            }
+            else if (isKmbRoute)
             {
                 _logger?.LogDebug("Using fast bulk KMB API for route {routeNumber}", Route.RouteNumber);
                 etaData = await _etaService.FetchKmbEtaForRoute(
@@ -1064,7 +1049,8 @@ public partial class RouteDetailsPage : ContentPage
             }
             else
             {
-                // Fallback to the old method for non-KMB routes
+                // Fallback to the generic method for other routes
+                _logger?.LogDebug("Using generic API for route {routeNumber}", Route.RouteNumber);
                 etaData = await _etaService.FetchEtaForRoute(
                     Route.Id, 
                     Route.RouteNumber, 

@@ -12,10 +12,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using hk_realtime_transport_info_maui.Models;
 using Microsoft.Extensions.Logging;
-using System.Threading.Tasks;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Threading;
+using System.Text;
 
 namespace hk_realtime_transport_info_maui.Services
 {
@@ -27,6 +24,9 @@ namespace hk_realtime_transport_info_maui.Services
         private readonly string _kmbStopEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/eta";
         private readonly string _kmbRouteEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/route-eta";
         private readonly string _kmbStopSpecificEtaBaseUrl = "https://data.etabus.gov.hk/v1/transport/kmb/stop-eta";
+        
+        // MTR API base URLs
+        private readonly string _mtrBusEtaUrl = "https://rt.data.gov.hk/v1/transport/mtr/bus/getSchedule";
         
         // Cached JsonSerializerOptions to avoid recreating them on each request
         private readonly JsonSerializerOptions _jsonOptions;
@@ -71,6 +71,12 @@ namespace hk_realtime_transport_info_maui.Services
         private readonly ConcurrentDictionary<string, bool> _stopHasNoEtas = 
             new ConcurrentDictionary<string, bool>();
         private DateTime _lastEtaRequestTime = DateTime.MinValue;
+        
+        // MTR API cache tracking
+        private readonly ConcurrentDictionary<string, bool> _mtrStopHasNoEtas = 
+            new ConcurrentDictionary<string, bool>();
+        private readonly ConcurrentDictionary<string, Task<List<TransportEta>>> _pendingMtrEtaRequests = 
+            new ConcurrentDictionary<string, Task<List<TransportEta>>>();
 
         public EtaService(HttpClient httpClient, LiteDbService databaseService, ILogger<EtaService> logger, CacheService cacheService)
         {
@@ -86,6 +92,25 @@ namespace hk_realtime_transport_info_maui.Services
                 NumberHandling = JsonNumberHandling.AllowReadingFromString,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             };
+            
+            _logger?.LogInformation("Initialized EtaService");
+        }
+
+        // Helper method to get the appropriate language code for MTR API
+        private string GetMtrApiLanguage()
+        {
+            // Get current UI culture
+            var currentCulture = CultureInfo.CurrentUICulture.Name.ToLowerInvariant();
+            
+            // MTR API only supports "en" or "zh" (not "zh-hans" or other variants)
+            if (currentCulture.StartsWith("zh"))
+            {
+                _logger?.LogDebug("Using 'zh' language for MTR API based on culture: {culture}", currentCulture);
+                return "zh";
+            }
+            
+            _logger?.LogDebug("Using 'en' language for MTR API based on culture: {culture}", currentCulture);
+            return "en";
         }
 
         /// <summary>
@@ -128,9 +153,6 @@ namespace hk_realtime_transport_info_maui.Services
                 return cachedEtas;
             }
             
-            int retryCount = 0;
-            while (true)
-            {
                 try
                 {
                     string url = $"{_kmbStopEtaBaseUrl}/{stopId}/{routeNumber}/{serviceType}";
@@ -140,6 +162,7 @@ namespace hk_realtime_transport_info_maui.Services
                     using var cts = new CancellationTokenSource();
                     cts.CancelAfter(TimeSpan.FromSeconds(10)); // 10 second timeout
                     
+                // Use HTTP client with centralized retry mechanism
                     var response = await _httpClient.GetAsync(url, cts.Token);
                     
                     // Check for specific status codes
@@ -152,26 +175,13 @@ namespace hk_realtime_transport_info_maui.Services
                     
                     if (!response.IsSuccessStatusCode)
                     {
-                        if (retryCount < MaxRetryAttempts)
-                        {
-                            retryCount++;
-                            _logger?.LogWarning("Failed to fetch KMB stop ETA data (attempt {retryCount}/{maxRetries}): {statusCode}", 
-                                retryCount, MaxRetryAttempts, response.StatusCode);
-                            
-                            // Exponential backoff
-                            await Task.Delay(RetryDelayMilliseconds * retryCount);
-                            continue;
-                        }
-                        
-                        _logger?.LogError("Failed to fetch KMB stop ETA data after {attempts} attempts: {statusCode}", 
-                            MaxRetryAttempts, response.StatusCode);
+                    _logger?.LogError("Failed to fetch KMB stop ETA data: {statusCode}", response.StatusCode);
                         return new List<TransportEta>();
                     }
 
                     // Use ReadAsStreamAsync for better performance with large responses
                     var stream = await response.Content.ReadAsStreamAsync();
                     
-                    // Try to deserialize using System.Text.Json
                     try 
                     {
                         var etaResponse = await JsonSerializer.DeserializeAsync<KmbEtaResponse>(stream, _jsonOptions);
@@ -238,51 +248,19 @@ namespace hk_realtime_transport_info_maui.Services
                     }
                     catch (JsonException ex)
                     {
-                        if (retryCount < MaxRetryAttempts)
-                        {
-                            retryCount++;
-                            _logger?.LogWarning(ex, "Error deserializing KMB stop ETA response (attempt {retryCount}/{maxRetries})", 
-                                retryCount, MaxRetryAttempts);
-                            
-                            await Task.Delay(RetryDelayMilliseconds * retryCount);
-                            continue;
-                        }
-                        
-                        _logger?.LogError(ex, "Error deserializing KMB stop ETA response after {attempts} attempts", MaxRetryAttempts);
+                        _logger?.LogError(ex, "Error deserializing KMB stop ETA response for stop {stopId}", stopId);
                         return new List<TransportEta>();
                     }
                 }
                 catch (TaskCanceledException ex)
                 {
-                    if (retryCount < MaxRetryAttempts)
-                    {
-                        retryCount++;
-                        _logger?.LogWarning(ex, "KMB ETA request timed out (attempt {retryCount}/{maxRetries})", 
-                            retryCount, MaxRetryAttempts);
-                        
-                        await Task.Delay(RetryDelayMilliseconds * retryCount);
-                        continue;
-                    }
-                    
-                    _logger?.LogError(ex, "KMB ETA request timed out after {attempts} attempts", MaxRetryAttempts);
+                _logger?.LogError(ex, "KMB ETA request timed out for stop {stopId}", stopId);
                     return new List<TransportEta>();
                 }
                 catch (Exception ex)
                 {
-                    if (retryCount < MaxRetryAttempts)
-                    {
-                        retryCount++;
-                        _logger?.LogWarning(ex, "Error fetching ETA data for KMB stop (attempt {retryCount}/{maxRetries})", 
-                            retryCount, MaxRetryAttempts);
-                        
-                        await Task.Delay(RetryDelayMilliseconds * retryCount);
-                        continue;
-                    }
-                    
-                    _logger?.LogError(ex, "Error fetching ETA data for KMB stop {stopId} route {routeNumber} after {attempts} attempts", 
-                        stopId, routeNumber, MaxRetryAttempts);
+                _logger?.LogError(ex, "Error fetching ETA data for KMB stop {stopId} route {routeNumber}", stopId, routeNumber);
                     return new List<TransportEta>();
-                }
             }
         }
 
@@ -581,8 +559,16 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         public async Task<List<TransportEta>> FetchEtaForStop(string stopId, string routeNumber, string serviceType)
         {
-            // Currently only KMB is supported, others will be added in the future
-            return await FetchKmbEtaForStop(stopId, routeNumber, serviceType);
+            // Check operator type based on stop ID
+            if (stopId.StartsWith("MTR-"))
+            {
+                return await FetchMtrEtaForStop(stopId, routeNumber, serviceType);
+            }
+            else
+            {
+                // Default to KMB for now
+                return await FetchKmbEtaForStop(stopId, routeNumber, serviceType);
+            }
         }
 
         /// <summary>
@@ -590,10 +576,511 @@ namespace hk_realtime_transport_info_maui.Services
         /// </summary>
         public async Task<Dictionary<string, List<TransportEta>>> FetchEtaForRoute(string routeId, string routeNumber, string serviceType, List<TransportStop> stops)
         {
-            // Currently only KMB is supported, others will be added in the future
-            return await FetchKmbEtaForRoute(routeId, routeNumber, serviceType);
+            // Check operator type based on route ID
+            if (routeId.StartsWith("MTR_"))
+            {
+                return await FetchMtrEtaForRoute(routeNumber, serviceType, stops);
+            }
+            else
+            {
+                // Default to KMB for now
+                return await FetchKmbEtaForRoute(routeId, routeNumber, serviceType);
+            }
         }
         
+        /// <summary>
+        /// Fetches MTR bus ETA data for a specific stop
+        /// </summary>
+        public async Task<List<TransportEta>> FetchMtrEtaForStop(string stopId, string routeNumber, string serviceType)
+        {
+            // Create a cache key
+            string cacheKey = $"eta_mtr_{stopId}_{routeNumber}_{serviceType}";
+            
+            // Try to get from cache first using the enhanced cache service
+            if (_cacheService.TryGetValue(cacheKey, out List<TransportEta>? cachedEtas) && cachedEtas != null)
+            {
+                _logger?.LogDebug("Retrieved ETAs for MTR stop {stopId} route {routeNumber} from cache", stopId, routeNumber);
+                return cachedEtas;
+            }
+            
+            // Extract direction from the stopId (MTR-XXX-[U|D]XXX format)
+            string direction = stopId.Contains("-U") ? "O" : "I"; // O = outbound (U), I = inbound (D)
+            
+            try
+            {
+                // Get all ETAs for this MTR stop and filter for the specific route
+                var allEtas = await FetchAllMtrEtaForStop(stopId);
+                
+                // Filter for the specific route
+                var filteredEtas = allEtas.Where(eta => 
+                    eta.RouteNumber == routeNumber && 
+                    eta.Direction == direction).ToList();
+                
+                // Cache the filtered results
+                _cacheService.Set(cacheKey, filteredEtas, EtaCacheExpiration);
+                
+                return filteredEtas;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching ETAs for MTR stop {stopId} route {routeNumber}", stopId, routeNumber);
+                return new List<TransportEta>();
+            }
+        }
+        
+        /// <summary>
+        /// Main method to fetch MTR ETAs for a route by making a single API call and processing for multiple stops
+        /// </summary>
+        public async Task<Dictionary<string, List<TransportEta>>> FetchMtrEtaForRoute(string routeNumber, string serviceType, List<TransportStop> stops)
+        {
+            // Create a cache key
+            string cacheKey = $"eta_mtr_route_{routeNumber}_{serviceType}";
+            
+            _logger?.LogDebug("Starting FetchMtrEtaForRoute for route {routeNumber}, serviceType {serviceType}", routeNumber, serviceType);
+            
+            // Try to get from cache first
+            if (_cacheService.TryGetValue(cacheKey, out Dictionary<string, List<TransportEta>>? cachedEtas) && cachedEtas != null)
+            {
+                _logger?.LogDebug("Retrieved ETAs for MTR route {routeNumber} from cache", routeNumber);
+                return cachedEtas;
+            }
+            
+            var result = new Dictionary<string, List<TransportEta>>();
+            
+            try
+            {
+                // Since MTR API only has one endpoint that returns all data for a route,
+                // we make a single API call and then filter for the stops we need
+                
+                // Get language parameter - MTR API only supports "en" or "zh"
+                string language = GetMtrApiLanguage();
+                
+                // Prepare the POST request for MTR API
+                using var content = new StringContent(
+                    $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}",
+                    Encoding.UTF8,
+                    "application/json");
+                
+                using var cts = new CancellationTokenSource();
+                cts.CancelAfter(TimeSpan.FromSeconds(15)); // 15 second timeout for route data
+                
+                string requestBody = $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}";
+                _logger?.LogDebug("Sending MTR ETA API request for route {routeNumber} to URL: {url} with language: {language} and body: {body}", 
+                    routeNumber, _mtrBusEtaUrl, language, requestBody);
+                
+                // Make the API request
+                var response = await _httpClient.PostAsync(_mtrBusEtaUrl, content, cts.Token);
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    // First read the response as a string to inspect it before deserializing
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    _logger?.LogDebug("MTR API raw response for route {routeNumber}: {content}", routeNumber, responseContent);
+                    
+                    if (string.IsNullOrEmpty(responseContent) || responseContent.Contains("error"))
+                    {
+                        _logger?.LogWarning("MTR API returned error or empty response for route {routeNumber}: {content}", 
+                            routeNumber, responseContent);
+                        return result;
+                    }
+                    
+                    // Now deserialize using stream and the JsonSerializer
+                    try
+                    {
+                        // Convert string back to stream for deserialization
+                        using var responseData = new MemoryStream(Encoding.UTF8.GetBytes(responseContent));
+                        var mtrResponse = await JsonSerializer.DeserializeAsync<MtrEtaResponse>(responseData, _jsonOptions);
+                        
+                        if (mtrResponse?.Data != null && mtrResponse.Data.Count > 0)
+                        {
+                            _logger?.LogDebug("MTR ETA API returned data for route {routeNumber}: routeStatus={routeStatus}, stopCount={stopCount}",
+                                routeNumber,
+                                mtrResponse.RouteStatus,
+                                mtrResponse.Data.Count);
+                                    
+                            // Process each stop from our list
+                            foreach (var stop in stops)
+                            {
+                                // Extract stopId from MTR stop format (e.g., MTR-506-U040)
+                                var parts = stop.Id.Split('-');
+                                if (parts.Length < 3)
+                                {
+                                    _logger?.LogWarning("Invalid stop ID format: {stopId}", stop.Id);
+                                    continue;
+                                }
+                                
+                                string stopNumber = parts[1];
+                                string directionPart = parts[2];
+                                // Make sure to trim any non-alphanumeric characters from the busStopId
+                                string stopId = $"{stopNumber}-{directionPart.TrimStart('U', 'D', 'u', 'd')}";
+                                string rawStopId = $"{stopNumber}-{directionPart}";
+                                
+                                _logger?.LogDebug("Looking for stop {rawId} or {cleanId} in MTR API response", rawStopId, stopId);
+                                
+                                // Look for matching stop in API response with different matching strategies
+                                var matchingStop = mtrResponse.Data.FirstOrDefault(s => 
+                                    s.BusStopId == stopId ||
+                                    s.BusStopId == rawStopId ||
+                                    (s.BusStopId?.Contains(stopNumber) == true && (s.BusStopId?.EndsWith(directionPart) == true)));
+                                
+                                if (matchingStop == null)
+                                {
+                                    _logger?.LogDebug("No matching stop found in MTR API response for stop {stopId}", stop.Id);
+                                    continue;
+                                }
+                                
+                                // Convert ETAs for this stop
+                                var stopEtas = ConvertMtrEtas(matchingStop, stop.Id, routeNumber);
+                                
+                                // Only add if we have ETAs
+                                if (stopEtas.Count > 0)
+                                {
+                                    result[stop.Id] = stopEtas;
+                                }
+                            }
+                            
+                            // Cache the result
+                            _cacheService.Set(cacheKey, result, EtaCacheExpiration);
+                            
+                            _logger?.LogDebug("Successfully processed and cached ETAs for {count} stops on MTR route {routeNumber}", 
+                                result.Count, routeNumber);
+                        }
+                        else
+                        {
+                            _logger?.LogWarning("MTR ETA API returned null response or empty data for route {routeNumber}", routeNumber);
+                        }
+                    }
+                    catch (JsonException ex)
+                    {
+                        _logger?.LogError(ex, "Error deserializing MTR API response: {message}", ex.Message);
+                        _logger?.LogDebug("Problematic JSON: {json}", responseContent);
+                    }
+                }
+                else
+                {
+                    _logger?.LogWarning("MTR ETA API returned error status code for route {routeNumber}: {status}", 
+                        routeNumber, response.StatusCode);
+                    
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    _logger?.LogWarning("MTR ETA API error response content: {content}", responseContent);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching ETAs for MTR route {routeNumber}", routeNumber);
+            }
+            
+            return result;
+        }
+        
+        /// <summary>
+        /// Converts the MTR ETA API response to our internal TransportEta model
+        /// </summary>
+        private List<TransportEta> ConvertMtrEtas(MtrStopData stopData, string stopId, string routeNumber)
+        {
+            if (stopData?.Bus == null || stopData.Bus.Count == 0)
+            {
+                _logger?.LogWarning("Cannot convert MTR ETAs: stop has no bus data for stop {stopId}", stopId);
+                return new List<TransportEta>();
+            }
+            
+            var result = new List<TransportEta>();
+            var now = DateTime.Now;
+            
+            // Parse the direction from the stop ID
+            var parts = stopId.Split('-');
+            if (parts.Length < 3) 
+            {
+                _logger?.LogWarning("Invalid stop ID format during MTR ETA conversion: {stopId}", stopId);
+                return result;
+            }
+            
+            string directionPart = parts[2];
+            char directionChar = directionPart[0];
+            string direction = (directionChar == 'U' || directionChar == 'u') ? "O" : "I"; // O = outbound, I = inbound
+            
+            // Default service type for MTR routes
+            const string defaultServiceType = "1";
+            
+            _logger?.LogDebug("Converting MTR ETAs for stop {stopId}: busCount={busCount}", 
+                stopId, stopData.Bus.Count);
+            
+            int etaCount = 0;
+            foreach (var bus in stopData.Bus)
+            {
+                // Skip bus if no arrival time
+                if (string.IsNullOrEmpty(bus.ArrivalTimeInSecond))
+                {
+                    continue;
+                }
+                
+                // Calculate ETA time based on seconds from now
+                if (int.TryParse(bus.ArrivalTimeInSecond, out int secondsToArrival))
+                {
+                    DateTime etaTime = now.AddSeconds(secondsToArrival);
+                    
+                            // Calculate minutes remaining
+                    int minutes = (int)Math.Ceiling(secondsToArrival / 60.0);
+                                
+                            // Skip ETAs in the past
+                            if (minutes < 0) 
+                            {
+                                _logger?.LogDebug("Skipping past MTR ETA (minutes={minutes})", minutes);
+                                continue;
+                            }
+                            
+                    string etaId = $"MTR_{routeNumber}_{stopId}_{etaCount}_{direction}_{etaTime:yyyyMMddHHmmss}";
+                            
+                            var eta = new TransportEta
+                            {
+                                Id = etaId,
+                                StopId = stopId,
+                        RouteId = $"MTR_{routeNumber}_{defaultServiceType}_{direction}",
+                                RouteNumber = routeNumber,
+                        Direction = direction,
+                                ServiceType = defaultServiceType,
+                                FetchTime = now,
+                        Remarks = bus.BusRemark ?? string.Empty,
+                                EtaTime = etaTime,
+                                RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
+                        IsCancelled = !string.IsNullOrEmpty(bus.BusRemark) && 
+                                    bus.BusRemark.Contains("cancel", StringComparison.OrdinalIgnoreCase)
+                            };
+                            
+                            _logger?.LogDebug("Created MTR ETA for route {routeNumber}, stop {stopId}: minutes={minutes}, etaId={etaId}",
+                                routeNumber, stopId, minutes, etaId);
+                                
+                            result.Add(eta);
+                            etaCount++;
+                        }
+                        else
+                        {
+                    _logger?.LogWarning("Could not parse MTR arrival time seconds: {arrivalTime}", bus.ArrivalTimeInSecond);
+                }
+            }
+            
+            _logger?.LogDebug("Converted total of {count} MTR ETAs for stop {stopId}", result.Count, stopId);
+            return result;
+        }
+        
+        /// <summary>
+        /// Fetches all ETAs for a MTR stop without filtering for a specific route
+        /// </summary>
+        public async Task<List<TransportEta>> FetchAllMtrEtaForStop(string stopId)
+        {
+            string cacheKey = $"eta_mtr_all_{stopId}";
+            
+            // Make sure stopId starts with MTR- prefix
+            if (!stopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase) && !stopId.StartsWith("mtr-", StringComparison.OrdinalIgnoreCase))
+            {
+                stopId = $"MTR-{stopId}";
+                _logger?.LogDebug("Added MTR prefix to stop ID: {stopId}", stopId);
+            }
+            
+            _logger?.LogDebug("Starting FetchAllMtrEtaForStop for stop {stopId}", stopId);
+            
+            // Try to get from cache first
+            if (_cacheService.TryGetValue(cacheKey, out List<TransportEta>? cachedEtas) && cachedEtas != null)
+            {
+                _logger?.LogDebug("Retrieved all ETAs for MTR stop {stopId} from cache", stopId);
+                return cachedEtas;
+            }
+            
+            // If we recently determined this stop has no ETAs, return empty list quickly
+            if (_mtrStopHasNoEtas.ContainsKey(stopId))
+            {
+                _logger?.LogDebug("MTR stop {stopId} previously determined to have no ETAs, returning empty list", stopId);
+                return new List<TransportEta>();
+            }
+            
+            // Check if we already have a pending request for this stop
+            if (_pendingMtrEtaRequests.TryGetValue(stopId, out var pendingTask))
+            {
+                _logger?.LogDebug("Reusing pending MTR ETA request for stop {stopId}", stopId);
+                return await pendingTask;
+            }
+            
+            var tcs = new TaskCompletionSource<List<TransportEta>>();
+            _pendingMtrEtaRequests[stopId] = tcs.Task;
+            
+            try
+            {
+                // Parse the MTR route number and direction from the stop ID
+                // Format: MTR-{routeNumber}-{direction}{sequence}
+                // Example: MTR-506-U040 where 506 is the route number, U means upbound, 040 is the sequence
+                
+                var parts = stopId.Split('-');
+                if (parts.Length < 3)
+                {
+                    _logger?.LogWarning("Invalid MTR stop ID format: {stopId}", stopId);
+                    tcs.SetResult(new List<TransportEta>());
+                    _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                    return new List<TransportEta>();
+                }
+                
+                string routeNumber = parts[1];
+                string directionPart = parts[2];
+                string mtrStopId = $"{routeNumber}-{directionPart}";
+                
+                _logger?.LogDebug("Parsed MTR stop ID {stopId}: routeNumber={routeNumber}, directionPart={directionPart}, mtrStopId={mtrStopId}", 
+                    stopId, routeNumber, directionPart, mtrStopId);
+                
+                // Get language parameter - MTR API only supports "en" or "zh"
+                string language = GetMtrApiLanguage();
+                
+                // Prepare the POST request for MTR API
+                _logger?.LogDebug("Preparing MTR API request for route {routeNumber} with language: {language}", 
+                    routeNumber, language);
+                
+                using var content = new StringContent(
+                    $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}",
+                    Encoding.UTF8,
+                    "application/json");
+                
+                using var cts = new CancellationTokenSource();
+                cts.CancelAfter(TimeSpan.FromSeconds(10)); // 10 second timeout
+                
+                string requestBody = $"{{\"language\":\"{language}\",\"routeName\":\"{routeNumber}\"}}";
+                _logger?.LogInformation("Sending MTR ETA API request for route {routeNumber} at stop {stopId} to URL: {url} with body: {requestBody}", 
+                    routeNumber, stopId, _mtrBusEtaUrl, requestBody);
+                
+                // Make the API request using centralized retry mechanism
+                var response = await _httpClient.PostAsync(_mtrBusEtaUrl, content, cts.Token);
+                
+                _logger?.LogInformation("Received MTR API response for stop {stopId}, status: {statusCode}", 
+                    stopId, response.StatusCode);
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    // First read the response as a string to inspect it before deserializing
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    _logger?.LogDebug("MTR API raw response for stop {stopId}: {content}", stopId, responseContent);
+                    
+                    if (string.IsNullOrEmpty(responseContent) || responseContent.Contains("error"))
+                    {
+                        _logger?.LogWarning("MTR API returned error or empty response for stop {stopId}: {content}", 
+                            stopId, responseContent);
+                        var emptyList = new List<TransportEta>();
+                        _mtrStopHasNoEtas[stopId] = true;
+                        tcs.SetResult(emptyList);
+                        _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                        _cacheService.Set(cacheKey, emptyList, TimeSpan.FromSeconds(15));
+                        return emptyList;
+                    }
+                    
+                    try
+                    {
+                        // Convert string back to stream for deserialization
+                        using var responseData = new MemoryStream(Encoding.UTF8.GetBytes(responseContent));
+                        var mtrResponse = await JsonSerializer.DeserializeAsync<MtrEtaResponse>(responseData, _jsonOptions);
+                        
+                        if (mtrResponse?.Data != null && mtrResponse.Data.Count > 0)
+                        {
+                            _logger?.LogInformation("MTR ETA API returned data for stop {stopId}: route={route}, stopCount={stopCount}",
+                                stopId, 
+                                mtrResponse.RouteName,
+                                mtrResponse.Data.Count);
+                                
+                            // Make a more flexible search for matching stops - try both the raw format and a simpler format
+                            string cleanStopId = $"{routeNumber}-{directionPart.TrimStart('U', 'D', 'u', 'd')}";
+                            
+                            // Find the matching stop data with various matching strategies
+                            var matchingStop = mtrResponse.Data.FirstOrDefault(s => 
+                                s.BusStopId == mtrStopId || 
+                                s.BusStopId == cleanStopId ||
+                                (s.BusStopId?.Contains(routeNumber) == true && 
+                                (s.BusStopId?.EndsWith(directionPart) == true || 
+                                 s.BusStopId?.EndsWith(directionPart.TrimStart('U', 'D', 'u', 'd')) == true)));
+                                
+                            if (matchingStop == null)
+                            {
+                                _logger?.LogWarning("No matching stop found in MTR API response for stopId {mtrStopId} or {cleanStopId}", 
+                                    mtrStopId, cleanStopId);
+                                
+                                // Log all available stops from the response to help debug
+                                foreach (var dataStop in mtrResponse.Data)
+                                {
+                                    _logger?.LogDebug("Available stop in response: {busStopId}", dataStop.BusStopId);
+                                }
+                                
+                                var emptyList = new List<TransportEta>();
+                                _mtrStopHasNoEtas[stopId] = true;
+                                tcs.SetResult(emptyList);
+                                _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                                _cacheService.Set(cacheKey, emptyList, TimeSpan.FromSeconds(15));
+                                return emptyList;
+                            }
+                            
+                            // Convert to our internal format
+                            var result = ConvertMtrEtas(matchingStop, stopId, routeNumber);
+                            
+                            _logger?.LogDebug("Converted {count} MTR ETAs for stop {stopId}", result.Count, stopId);
+                            
+                            // Cache the results
+                            TimeSpan cacheExpiry = result.Count > 0 ? TimeSpan.FromSeconds(25) : TimeSpan.FromSeconds(15);
+                            _cacheService.Set(cacheKey, result, cacheExpiry);
+                            
+                            // Record if this stop has ETAs
+                            _mtrStopHasNoEtas[stopId] = result.Count == 0;
+                            
+                            tcs.SetResult(result);
+                            _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                            
+                            _logger?.LogDebug("Successfully retrieved {count} ETAs for MTR stop {stopId}", result.Count, stopId);
+                            return result;
+                        }
+                        else
+                        {
+                            _logger?.LogWarning("MTR ETA API returned null response or data for stop {stopId}", stopId);
+                            
+                            var emptyList = new List<TransportEta>();
+                            _mtrStopHasNoEtas[stopId] = true;
+                            
+                            tcs.SetResult(emptyList);
+                            _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                            _cacheService.Set(cacheKey, emptyList, TimeSpan.FromSeconds(15));
+                            
+                            return emptyList;
+                        }
+                    }
+                    catch (JsonException ex)
+                    {
+                        _logger?.LogError(ex, "Error deserializing MTR API response: {message}", ex.Message);
+                        _logger?.LogDebug("Problematic JSON: {json}", responseContent);
+                        
+                        var emptyList = new List<TransportEta>();
+                        tcs.SetException(ex);
+                        _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                        return emptyList;
+                    }
+                }
+                else
+                {
+                    _logger?.LogWarning("MTR ETA API returned error status code for stop {stopId}: {status}", 
+                        stopId, response.StatusCode);
+                    
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    _logger?.LogWarning("MTR ETA API error response content: {content}", responseContent);
+                    
+                    var emptyList = new List<TransportEta>();
+                    
+                    tcs.SetResult(emptyList);
+                    _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                    
+                    return emptyList;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error fetching ETAs for MTR stop {stopId}", stopId);
+                
+                tcs.SetException(ex);
+                _pendingMtrEtaRequests.TryRemove(stopId, out _);
+                
+                return new List<TransportEta>();
+            }
+        }
+
         /// <summary>
         /// Clears the ETA cache for the specified stop
         /// </summary>
@@ -874,91 +1361,6 @@ namespace hk_realtime_transport_info_maui.Services
                         return new List<TransportEta>();
                 }
             }
-        }
-
-        // Response classes remain the same
-        private class KmbEtaResponse
-        {
-            [JsonPropertyName("type")]
-            public string? Type { get; set; }
-            
-            [JsonPropertyName("version")]
-            public string? Version { get; set; }
-            
-            [JsonPropertyName("generated_timestamp")]
-            public string? GeneratedTimestamp { get; set; }
-            
-            [JsonPropertyName("data")]
-            public List<KmbEtaData>? Data { get; set; }
-        }
-        
-        private class KmbRouteEtaResponse
-        {
-            [JsonPropertyName("type")]
-            public string? Type { get; set; }
-            
-            [JsonPropertyName("version")]
-            public string? Version { get; set; }
-            
-            [JsonPropertyName("generated_timestamp")]
-            public string? GeneratedTimestamp { get; set; }
-            
-            [JsonPropertyName("data")]
-            public List<KmbEtaData>? Data { get; set; }
-        }
-        
-        private class KmbEtaData
-        {
-            [JsonPropertyName("co")]
-            public string? Company { get; set; }
-            
-            [JsonPropertyName("route")]
-            public string? Route { get; set; }
-            
-            [JsonPropertyName("dir")]
-            public string? Dir { get; set; }
-            
-            [JsonPropertyName("service_type")]
-            public int ServiceType { get; set; }
-            
-            [JsonPropertyName("stop_id")]
-            public string? StopId { get; set; }
-            
-            [JsonPropertyName("seq")]
-            public int Seq { get; set; }
-            
-            [JsonPropertyName("dest_tc")]
-            public string? DestTc { get; set; }
-            
-            [JsonPropertyName("dest_sc")]
-            public string? DestSc { get; set; }
-            
-            [JsonPropertyName("dest_en")]
-            public string? DestEn { get; set; }
-            
-            [JsonPropertyName("eta")]
-            public string? Eta { get; set; }
-            
-            [JsonPropertyName("eta_seq")]
-            public int EtaSeq { get; set; }
-            
-            [JsonPropertyName("rmk_tc")]
-            public string? RmkTc { get; set; }
-            
-            [JsonPropertyName("rmk_sc")]
-            public string? RmkSc { get; set; }
-            
-            [JsonPropertyName("rmk_en")]
-            public string? RmkEn { get; set; }
-            
-            [JsonPropertyName("dest")]
-            public string? Dest { get; set; }
-            
-            [JsonPropertyName("remarks")]
-            public string? Remarks { get; set; }
-            
-            [JsonPropertyName("data_timestamp")]
-            public string? DataTimestamp { get; set; }
         }
 
         /// <summary>
@@ -1242,6 +1644,8 @@ namespace hk_realtime_transport_info_maui.Services
                         var emptyList = new List<TransportEta>();
                         tcs.SetResult(emptyList);
                         _pendingEtaRequests.TryRemove(stopId, out _);
+                        _cacheService.Set(cacheKey, emptyList, TimeSpan.FromSeconds(15));
+                        
                         return emptyList;
                     }
                 }
@@ -1258,6 +1662,212 @@ namespace hk_realtime_transport_info_maui.Services
                 _logger?.LogError(ex, "Error in FetchAllKmbEtaForStopOptimized for stop {kmbStopId}", stopId);
                 return new List<TransportEta>();
             }
+        }
+
+        // Response classes for MTR ETA API
+        public class MtrEtaResponse
+        {
+            [JsonPropertyName("status")]
+            public string Status { get; set; } = "0"; // Changed from int to string
+            
+            [JsonPropertyName("message")]
+            public string? Message { get; set; }
+            
+            [JsonPropertyName("caseNumber")]
+            public int CaseNumber { get; set; }
+            
+            [JsonPropertyName("caseNumberDetail")]
+            public string? CaseNumberDetail { get; set; }
+            
+            [JsonPropertyName("routeStatus")]
+            public string? RouteStatus { get; set; }
+            
+            [JsonPropertyName("routeStatusTime")]
+            public string? RouteStatusTime { get; set; }
+            
+            [JsonPropertyName("routeName")]
+            public string? RouteName { get; set; }
+            
+            [JsonPropertyName("routeStatusColour")]
+            public string? RouteStatusColour { get; set; }
+            
+            [JsonPropertyName("routeStatusRemarkTitle")]
+            public string? RouteStatusRemarkTitle { get; set; }
+            
+            [JsonPropertyName("routeStatusRemarkContent")]
+            public string? RouteStatusRemarkContent { get; set; }
+            
+            [JsonPropertyName("routeStatusRemarkFooterRemark")]
+            public string? RouteStatusRemarkFooterRemark { get; set; }
+            
+            [JsonPropertyName("footerRemarks")]
+            public string? FooterRemarks { get; set; }
+            
+            [JsonPropertyName("data")]
+            public List<MtrStopData>? Data { get; set; }
+        }
+        
+        public class MtrStopData
+        {
+            [JsonPropertyName("bus")]
+            public List<MtrBus>? Bus { get; set; }
+            
+            [JsonPropertyName("busStopId")]
+            public string? BusStopId { get; set; }
+            
+            [JsonPropertyName("busIcon")]
+            public string? BusIcon { get; set; }
+            
+            [JsonPropertyName("busStopRemark")]
+            public string? BusStopRemark { get; set; }
+            
+            [JsonPropertyName("busStopStatus")]
+            public string? BusStopStatus { get; set; }
+            
+            [JsonPropertyName("busStopStatusRemarkTitle")]
+            public string? BusStopStatusRemarkTitle { get; set; }
+            
+            [JsonPropertyName("busStopStatusRemarkContent")]
+            public string? BusStopStatusRemarkContent { get; set; }
+            
+            [JsonPropertyName("busStopStatusTime")]
+            public string? BusStopStatusTime { get; set; }
+            
+            [JsonPropertyName("isSuspended")]
+            public string? IsSuspended { get; set; }
+        }
+        
+        public class MtrBus
+        {
+            [JsonPropertyName("busId")]
+            public string? BusId { get; set; }
+            
+            [JsonPropertyName("direction")]
+            public string Direction { get; set; } = "O"; // O = outbound, I = inbound
+            
+            [JsonPropertyName("stopId")]
+            public string? StopId { get; set; }
+            
+            [JsonPropertyName("isScheduled")]
+            public string IsScheduled { get; set; } = "0"; // Changed from bool to string
+            
+            [JsonPropertyName("arrivalTimeInSecond")]
+            public string? ArrivalTimeInSecond { get; set; }
+            
+            [JsonPropertyName("arrivalTimeText")]
+            public string? ArrivalTimeText { get; set; }
+            
+            [JsonPropertyName("departureTimeInSecond")]
+            public string? DepartureTimeInSecond { get; set; }
+            
+            [JsonPropertyName("departureTimeText")]
+            public string? DepartureTimeText { get; set; }
+            
+            [JsonPropertyName("isDelayed")]
+            public string? IsDelayed { get; set; }
+            
+            [JsonPropertyName("busRemark")]
+            public string? BusRemark { get; set; }
+            
+            [JsonPropertyName("busLocation")]
+            public MtrBusLocation? BusLocation { get; set; }
+            
+            [JsonPropertyName("lineRef")]
+            public string? LineRef { get; set; }
+        }
+        
+        public class MtrBusLocation
+        {
+            [JsonPropertyName("latitude")]
+            public double Latitude { get; set; }
+            
+            [JsonPropertyName("longitude")]
+            public double Longitude { get; set; }
+        }
+        
+        // KMB Response classes
+        public class KmbEtaResponse
+        {
+            [JsonPropertyName("type")]
+            public string? Type { get; set; }
+            
+            [JsonPropertyName("version")]
+            public string? Version { get; set; }
+            
+            [JsonPropertyName("generated_timestamp")]
+            public string? GeneratedTimestamp { get; set; }
+            
+            [JsonPropertyName("data")]
+            public List<KmbEtaData>? Data { get; set; }
+        }
+        
+        public class KmbRouteEtaResponse
+        {
+            [JsonPropertyName("type")]
+            public string? Type { get; set; }
+            
+            [JsonPropertyName("version")]
+            public string? Version { get; set; }
+            
+            [JsonPropertyName("generated_timestamp")]
+            public string? GeneratedTimestamp { get; set; }
+            
+            [JsonPropertyName("data")]
+            public List<KmbEtaData>? Data { get; set; }
+        }
+        
+        public class KmbEtaData
+        {
+            [JsonPropertyName("co")]
+            public string? Company { get; set; }
+            
+            [JsonPropertyName("route")]
+            public string? Route { get; set; }
+            
+            [JsonPropertyName("dir")]
+            public string? Dir { get; set; }
+            
+            [JsonPropertyName("service_type")]
+            public int ServiceType { get; set; }
+            
+            [JsonPropertyName("stop_id")]
+            public string? StopId { get; set; }
+            
+            [JsonPropertyName("seq")]
+            public int Seq { get; set; }
+            
+            [JsonPropertyName("dest_tc")]
+            public string? DestTc { get; set; }
+            
+            [JsonPropertyName("dest_sc")]
+            public string? DestSc { get; set; }
+            
+            [JsonPropertyName("dest_en")]
+            public string? DestEn { get; set; }
+            
+            [JsonPropertyName("eta")]
+            public string? Eta { get; set; }
+            
+            [JsonPropertyName("eta_seq")]
+            public int EtaSeq { get; set; }
+            
+            [JsonPropertyName("rmk_tc")]
+            public string? RmkTc { get; set; }
+            
+            [JsonPropertyName("rmk_sc")]
+            public string? RmkSc { get; set; }
+            
+            [JsonPropertyName("rmk_en")]
+            public string? RmkEn { get; set; }
+            
+            [JsonPropertyName("dest")]
+            public string? Dest { get; set; }
+            
+            [JsonPropertyName("remarks")]
+            public string? Remarks { get; set; }
+            
+            [JsonPropertyName("data_timestamp")]
+            public string? DataTimestamp { get; set; }
         }
     }
 } 

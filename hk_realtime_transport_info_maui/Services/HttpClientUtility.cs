@@ -485,65 +485,33 @@ namespace hk_realtime_transport_info_maui.Services
                     
                     var startTime = DateTime.UtcNow;
                     
-                    // For large responses, we need to adjust our strategy - use ResponseHeadersRead instead of ResponseContentRead
-                    HttpCompletionOption completionOption = 
-                        request.Url.Contains("route-stop") ? // Check if this is the large route-stop API call
-                        HttpCompletionOption.ResponseHeadersRead : 
-                        HttpCompletionOption.ResponseContentRead;
-                    
-                    // Execute the request with the remaining time from the original timeout
+                    // Use a combined cancellation token that respects both the request token and a timeout
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(60)); // 60 second max timeout
                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
-                        request.CancellationToken, 
-                        _cancellationTokenSource.Token);
-                        
-                    // Set a timeout for this specific request
-                    // For large responses like route-stop, use a longer timeout
-                    var timeout = request.Url.Contains("route-stop") ? 
-                        TimeSpan.FromSeconds(90) : // 90 seconds for route-stop
-                        _httpClient.Timeout;
-                        
-                    linkedCts.CancelAfter(timeout);
+                        timeoutCts.Token, 
+                        request.CancellationToken);
                     
-                    var response = await _httpClient.SendAsync(requestMessage, completionOption, linkedCts.Token);
-                    
-                    // For large responses with ResponseHeadersRead, we need to ensure the content is read before returning
-                    if (completionOption == HttpCompletionOption.ResponseHeadersRead && response.IsSuccessStatusCode)
+                    // For large responses, we need to adjust our strategy - use ResponseHeadersRead instead of ResponseContentRead
+                    var completionOption = HttpCompletionOption.ResponseContentRead;
+                    if (request.Priority == PRIORITY_LOW)
                     {
-                        try
-                        {
-                            // Read the content as a stream to avoid memory issues
-                            var stream = await response.Content.ReadAsStreamAsync(linkedCts.Token);
-                            
-                            // If we got here, the content was successfully read
-                            _logger?.LogDebug("Large response content read successfully for {url}", request.Url);
-                        }
-                        catch (Exception ex)
-                        {
-                            // If we fail to read the content, treat it as a retryable error
-                            _logger?.LogWarning(ex, "Failed to read large response content for {url}, will retry", request.Url);
-                            
-                            // Dispose the response before retrying
-                            response.Dispose();
-                            
-                            if (retryCount < _maxRetryAttempts)
-                            {
-                                retryCount++;
-                                await Task.Delay(delay, linkedCts.Token);
-                                delay = Math.Min(delay * 2, _maxRetryDelayMs);
-                                continue;
-                            }
-                            
-                            // If we're out of retries, rethrow
-                            throw;
-                        }
+                        // Use ResponseHeadersRead for low priority requests to avoid blocking
+                        completionOption = HttpCompletionOption.ResponseHeadersRead;
                     }
                     
-                    var requestDuration = DateTime.UtcNow - startTime;
+                    // Make the HTTP request
+                    var response = await _httpClient.SendAsync(
+                        requestMessage, 
+                        completionOption, 
+                        linkedCts.Token);
                     
-                    // Log success
-                    _logger?.LogDebug("HTTP {method} {url} completed in {duration}ms with status {statusCode}",
-                        request.Method, request.Url, requestDuration.TotalMilliseconds, response.StatusCode);
+                    _logger?.LogTrace("HTTP {method} {url} completed in {elapsed}ms with status {statusCode}",
+                        request.Method.Method,
+                        request.Url,
+                        (DateTime.UtcNow - startTime).TotalMilliseconds,
+                        response.StatusCode);
                     
+                    // Check if we should retry based on the response status code
                     if (!response.IsSuccessStatusCode && ShouldRetry(response.StatusCode))
                     {
                         if (retryCount < _maxRetryAttempts)
@@ -859,7 +827,8 @@ namespace hk_realtime_transport_info_maui.Services
                    message.Contains("connection") || 
                    message.Contains("reset") ||
                    message.Contains("network") ||
-                   message.Contains("unreachable");
+                   message.Contains("unreachable") ||
+                   message.Contains("refuse");
         }
 
         /// <summary>
@@ -896,7 +865,10 @@ namespace hk_realtime_transport_info_maui.Services
         private bool IsNetworkStreamError(Exception ex)
         {
             // Check the message of this exception and any inner exceptions for network stream errors
-            if (ex.Message.Contains("NetworkStream") || ex.Message.Contains("network stream"))
+            if (ex.Message.Contains("NetworkStream") || 
+                ex.Message.Contains("network stream") ||
+                ex.Message.Contains("socket") ||
+                ex.Message.Contains("connection was aborted"))
                 return true;
                 
             if (ex.InnerException != null)
@@ -904,7 +876,9 @@ namespace hk_realtime_transport_info_maui.Services
                 return ex.InnerException.Message.Contains("NetworkStream") || 
                        ex.InnerException.Message.Contains("network stream") ||
                        ex.InnerException.Message.Contains("disposed") ||
-                       ex.InnerException.Message.Contains("read operation");
+                       ex.InnerException.Message.Contains("read operation") ||
+                       ex.InnerException.Message.Contains("socket") ||
+                       ex.InnerException.Message.Contains("connection was aborted");
             }
             
             return false;

@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using hk_realtime_transport_info_maui.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Maui.Controls;
+using NGeoHash;
 
 namespace hk_realtime_transport_info_maui.Services
 {
@@ -643,7 +644,7 @@ namespace hk_realtime_transport_info_maui.Services
                         var stopKey = $"MTR-{stationIdCsv}";
                         if (!existingStopKeys.Contains(stopKey) && !uniqueStops.Any(s => s.Id == stopKey))
                         {
-                            uniqueStops.Add(new TransportStop
+                            var stop = new TransportStop
                             {
                                 Id = stopKey,
                                 StopId = stationIdCsv,
@@ -653,8 +654,27 @@ namespace hk_realtime_transport_info_maui.Services
                                 NameZhHans = nameZh,
                                 Latitude = lat,
                                 Longitude = lng,
-                                Operator = TransportOperator.MTR
-                            });
+                                Operator = TransportOperator.MTR,
+                                LastUpdated = DateTime.UtcNow
+                            };
+                            
+                            // Generate geohashes for location-based filtering
+                            if (stop.Latitude != 0 && stop.Longitude != 0)
+                            {
+                                try
+                                {
+                                    // Generate geohashes with different precision for different search scenarios
+                                    stop.GeoHash6 = GeoHash.Encode(stop.Latitude, stop.Longitude, 6);
+                                    stop.GeoHash7 = GeoHash.Encode(stop.Latitude, stop.Longitude, 7);
+                                    stop.GeoHash8 = GeoHash.Encode(stop.Latitude, stop.Longitude, 8);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogError(ex, "Error generating geohash for MTR stop {stopId}", stop.StopId);
+                                }
+                            }
+                            
+                            uniqueStops.Add(stop);
                         }
                         
                         // Process RouteStopRelation

@@ -174,6 +174,24 @@ public partial class App : Application
 		
 		// Start the background service
 		_backgroundService?.Start();
+		
+		// Set initial language for API calls based on current culture
+		try
+		{
+			var etaService = IPlatformApplication.Current?.Services?.GetService<EtaService>();
+			if (etaService != null)
+			{
+				// Get current culture
+				var cultureName = CultureInfo.CurrentCulture.Name;
+				
+				// EtaService now handles language mapping internally
+				_logger.LogInformation("Set app culture to: {culture}", cultureName);
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger.LogError(ex, "Error setting culture");
+		}
 	}
 	
 	protected override void OnSleep()
@@ -392,6 +410,14 @@ public partial class App : Application
 			
 			// Update string resources based on culture
 			UpdateStringResources(cultureName);
+			
+			// Update EtaService language setting
+			var etaService = IPlatformApplication.Current?.Services?.GetService<EtaService>();
+			if (etaService != null)
+			{
+				// EtaService now handles language mapping internally
+				Console.WriteLine($"Set app culture to: {cultureName}");
+			}
 		}
 		catch (Exception ex)
 		{

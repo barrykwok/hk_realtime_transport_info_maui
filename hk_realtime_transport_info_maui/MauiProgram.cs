@@ -116,7 +116,12 @@ public static class MauiProgram
 			var logger = sp.GetRequiredService<ILogger<EtaService>>();
 			var cacheService = sp.GetRequiredService<CacheService>();
 			
-			return new EtaService(httpClient, liteDbService, logger, cacheService);
+			var etaService = new EtaService(httpClient, liteDbService, logger, cacheService);
+			
+			// EtaService now handles language mapping internally
+			logger.LogInformation("Initialized EtaService with culture: {culture}", CultureInfo.CurrentCulture.Name);
+			
+			return etaService;
 		});
 		
 		// Register location cache service

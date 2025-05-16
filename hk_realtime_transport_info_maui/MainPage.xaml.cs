@@ -2505,16 +2505,26 @@ public partial class MainPage : ContentPage
 			_logger?.LogDebug("Fetching ETAs for stop: {stopId} ({stopName})", 
 				stopGroup.Stop.StopId, stopGroup.Stop.LocalizedName);
 				
-			// Get ETAs for this specific stop
-			var allEtas = await _etaService.FetchAllKmbEtaForStop(stopGroup.Stop.StopId);
+			// Check if it's an MTR stop or KMB stop
+			List<TransportEta> allEtas;
+			if (stopGroup.Stop.Id.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+			{
+				_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId}", stopGroup.Stop.Id);
+				allEtas = await _etaService.FetchAllMtrEtaForStop(stopGroup.Stop.Id);
+			}
+			else
+			{
+				_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId}", stopGroup.Stop.Id);
+				allEtas = await _etaService.FetchAllKmbEtaForStop(stopGroup.Stop.Id);
+			}
 			
 			if (allEtas.Count == 0)
 			{
-				_logger?.LogDebug("No ETAs found for stop: {stopId}", stopGroup.Stop.StopId);
+				_logger?.LogDebug("No ETAs found for stop: {stopId}", stopGroup.Stop.Id);
 				return;
 			}
 			
-			_logger?.LogDebug("Found {count} ETAs for stop: {stopId}", allEtas.Count, stopGroup.Stop.StopId);
+			_logger?.LogDebug("Found {count} ETAs for stop: {stopId}", allEtas.Count, stopGroup.Stop.Id);
 			
 			// Update the UI on the main thread
 			await MainThread.InvokeOnMainThreadAsync(() =>
@@ -2544,7 +2554,7 @@ public partial class MainPage : ContentPage
 					}
 					
 					_logger?.LogDebug("Updated ETAs for {updated}/{total} routes at stop {stopId}", 
-						routesUpdated, stopGroup.Routes.Count, stopGroup.Stop.StopId);
+						routesUpdated, stopGroup.Routes.Count, stopGroup.Stop.Id);
 				}
 				catch (Exception ex)
 				{
@@ -2729,7 +2739,18 @@ public partial class MainPage : ContentPage
 								
 								// Get all ETAs for this stop
 								_logger?.LogDebug("Fetching ETAs for stop: {stopId}", stopId);
-								var allEtas = await _etaService.FetchAllKmbEtaForStop(stopId);
+								
+								List<TransportEta> allEtas;
+								if (stopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+								{
+									_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId}", stopId);
+									allEtas = await _etaService.FetchAllMtrEtaForStop(stopId);
+								}
+								else
+								{
+									_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId}", stopId);
+									allEtas = await _etaService.FetchAllKmbEtaForStop(stopId);
+								}
 								
 								if (allEtas.Count == 0)
 								{
@@ -3283,16 +3304,34 @@ public partial class MainPage : ContentPage
 				return;
 			}
 				
-			// Get ETAs for this stop
-			var allEtas = await _etaService.FetchAllKmbEtaForStop(stopGroup.Stop.StopId);
+			// Get ETAs for this stop - check if it's an MTR stop or KMB stop
+			List<TransportEta> allEtas;
+			
+			if (stopGroup.Stop.Id.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+			{
+				_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId}", stopGroup.Stop.StopId);
+				allEtas = await _etaService.FetchAllMtrEtaForStop(stopGroup.Stop.StopId);
+			}
+			else
+			{
+				_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId}", stopGroup.Stop.StopId);
+				allEtas = await _etaService.FetchAllKmbEtaForStop(stopGroup.Stop.StopId);
+			}
 			
 			if (allEtas.Count == 0)
 			{
-				_logger?.LogDebug("No ETAs found for stop: {stopId}", stopGroup.Stop.StopId);
+				_logger?.LogInformation("No ETAs found for stop: {stopId}, full ID: {fullId}", 
+				    stopGroup.Stop.StopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase) ? 
+				        stopGroup.Stop.StopId.Substring(4) : stopGroup.Stop.StopId, 
+				    stopGroup.Stop.StopId);
 				return;
 			}
 			
-			_logger?.LogDebug("Found {count} ETAs for stop: {stopId}", allEtas.Count, stopGroup.Stop.StopId);
+			_logger?.LogInformation("Found {count} ETAs for stop: {stopId}, full ID: {fullId}", 
+			    allEtas.Count, 
+			    stopGroup.Stop.StopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase) ? 
+			        stopGroup.Stop.StopId.Substring(4) : stopGroup.Stop.StopId, 
+			    stopGroup.Stop.StopId);
 			
 			// Filter ETAs to prioritize service type "1" when multiple service types exist for a route
 			// First group by route number to find duplicates
@@ -3394,7 +3433,20 @@ public partial class MainPage : ContentPage
 						{
 							try
 							{
-								var etas = await _etaService.FetchAllKmbEtaForStopOptimized(stopId);
+								// Check if it's an MTR stop or KMB stop
+								List<TransportEta> etas;
+								
+								if (stopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+								{
+									_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId} in batch", stopId);
+									etas = await _etaService.FetchAllMtrEtaForStop(stopId);
+								}
+								else
+								{
+									_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId} in batch", stopId);
+									etas = await _etaService.FetchAllKmbEtaForStopOptimized(stopId);
+								}
+								
 								var relatedOriginalGroups = originalStopGroups.Where(sg => sg.Stop.Id == stopId).ToList();
 								
 								foreach (var group in relatedOriginalGroups)
@@ -4273,8 +4325,19 @@ public partial class MainPage : ContentPage
 		{
 			_logger?.LogDebug("Fetching ETAs for stop: {stopId} ({stopName})", stop.Id, stop.Name);
 			
-			// Use the optimized method that handles caching and queuing
-			var etas = await _etaService.FetchAllKmbEtaForStopOptimized(stop.Id);
+					// Check if it's an MTR stop or KMB stop
+		List<TransportEta> etas;
+		
+		if (stop.Id.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+			{
+				_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId}", stop.Id);
+				etas = await _etaService.FetchAllMtrEtaForStop(stop.Id);
+			}
+			else
+			{
+				_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId}", stop.Id);
+				etas = await _etaService.FetchAllKmbEtaForStopOptimized(stop.Id);
+			}
 			
 			if (etas.Count == 0)
 			{
