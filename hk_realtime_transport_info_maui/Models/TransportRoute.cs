@@ -191,9 +191,7 @@ namespace hk_realtime_transport_info_maui.Models
         {
             get 
             {
-                // Only return true if FirstEta exists AND the ETA is for a future time
-                // (NextEta contains the actual ETA object with timestamp)
-                var hasEta = !string.IsNullOrEmpty(FirstEta) && (NextEta?.IsActive ?? false);
+                var hasEta = !string.IsNullOrEmpty(FirstEta);
                 // For debugging - REMOVED: System.Diagnostics.Debug.WriteLine($"HasEta for {RouteNumber}: {hasEta}");
                 return hasEta;
             }

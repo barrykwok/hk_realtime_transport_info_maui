@@ -154,23 +154,7 @@ namespace hk_realtime_transport_info_maui
         /// <summary>
         /// Returns true when at least one route has a valid ETA
         /// </summary>
-        public bool HasAnyVisibleRoutesWithEta 
-        { 
-            get 
-            {
-                // Recheck actual routes dynamically since _routesWithEtaCount might be stale
-                if (_routes != null)
-                {
-                    return _routes.Any(r => r?.HasEta == true && r.NextEta?.IsActive == true);
-                }
-                else if (_routesList != null)
-                {
-                    return _routesList.Any(r => r?.HasEta == true && r.NextEta?.IsActive == true);
-                }
-                
-                return _routesWithEtaCount > 0;
-            }
-        }
+        public bool HasAnyVisibleRoutesWithEta => _routesWithEtaCount > 0;
 
         // Get ETA for a specific route
         public TransportEta? GetEtaForRoute(string routeNumber, string serviceType, string bound)

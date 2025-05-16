@@ -1924,29 +1924,10 @@ public partial class MainPage : ContentPage
 			_logger.LogInformation("UpdateNearbyStops: Current user location is Lat={Lat}, Lng={Lng}", _userLocation.Latitude, _userLocation.Longitude);
 			
 			var userFullGeohash = NGeoHash.GeoHash.Encode(_userLocation.Latitude, _userLocation.Longitude, 8); 
-			var userGeoHash6 = userFullGeohash.Substring(0, Math.Min(6, userFullGeohash.Length));
 			_logger.LogDebug("UpdateNearbyStops: User location geohash: CenterGH6={CenterGH6}, FullGH8={FullGH8}", 
-					userGeoHash6, userFullGeohash);
+				userFullGeohash.Substring(0, Math.Min(6, userFullGeohash.Length)), userFullGeohash);
 
-			// Check if we already have nearby stops cached for this geohash
-			if (_cachedRawStopsByCenterGeoHash6.ContainsKey(userGeoHash6))
-			{
-				_logger.LogInformation("Using cached stops for geohash {0}", userGeoHash6);
-				var cachedStops = _cachedRawStopsByCenterGeoHash6[userGeoHash6];
-				
-				// Update distances for cached stops based on current user location
-				foreach (var stop in cachedStops)
-				{
-					var stopLocation = new Location(stop.Latitude, stop.Longitude);
-					stop.DistanceFromUser = Location.CalculateDistance(_userLocation, stopLocation, DistanceUnits.Kilometers) * 1000;
-				}
-				
-				// Process the cached stops directly
-				ProcessNearbyStops(cachedStops);
-				return;
-			}
-
-			// If not in cache, get nearby stops using the LocationCacheService
+			// Get nearby stops using the LocationCacheService instead of local cache or direct DB call
 			List<TransportStop> nearbyStops = await _locationCacheService.GetNearbyStopsAsync(
 				_userLocation.Latitude, _userLocation.Longitude, 1000);
 				
@@ -1960,61 +1941,13 @@ public partial class MainPage : ContentPage
 				return;
 			}
 
-			// Cache the raw stops for this geohash
-			_cachedRawStopsByCenterGeoHash6[userGeoHash6] = new List<TransportStop>(nearbyStops);
-			
-			// Process the stops into distance buckets
-			ProcessNearbyStops(nearbyStops);
-		}
-		catch (Exception ex)
-		{
-			_logger.LogError(ex, "Error updating nearby stops: {Message}", ex.Message);
-			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
-		}
-	}
-	
-	// Separate processing logic for better reuse
-	private void ProcessNearbyStops(List<TransportStop> nearbyStops)
-	{
-		var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-		
-		// Create concurrent bags for thread-safe collection - much faster than regular lists
-		var stops100m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
-		var stops200m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
-		var stops400m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
-		var stops600m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
+			// Create concurrent bags for thread-safe collection
+			var stops100m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
+			var stops200m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
+			var stops400m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
+			var stops600m = new System.Collections.Concurrent.ConcurrentBag<TransportStop>();
 
-		// For large lists, use parallel processing
-		if (nearbyStops.Count > 50)
-		{
-			// Use parallel processing for a significant performance boost with large stop lists
-			Parallel.ForEach(nearbyStops, stop => 
-			{
-				// Add to appropriate distance buckets
-				if (stop.DistanceFromUser <= 600)
-				{
-					stops600m.Add(stop);
-					
-					if (stop.DistanceFromUser <= 400)
-					{
-						stops400m.Add(stop);
-						
-						if (stop.DistanceFromUser <= 200)
-						{
-							stops200m.Add(stop);
-							
-							if (stop.DistanceFromUser <= 100)
-							{
-								stops100m.Add(stop);
-							}
-						}
-					}
-				}
-			});
-		}
-		else
-		{
-			// Use regular processing for small lists to avoid parallelization overhead
+			// Process stops based on their distance (already calculated by LocationCacheService)
 			foreach (var stop in nearbyStops)
 			{
 				// Add to appropriate distance buckets
@@ -2038,80 +1971,58 @@ public partial class MainPage : ContentPage
 					}
 				}
 			}
+
+			// Store the results
+			_stopsNearby["100m"] = stops100m.ToList();
+			_stopsNearby["200m"] = stops200m.ToList();
+			_stopsNearby["400m"] = stops400m.ToList();
+			_stopsNearby["600m"] = stops600m.ToList();
+
+			_logger.LogDebug("Found nearby stops: 100m={0}, 200m={1}, 400m={2}, 600m={3}",
+				stops100m.Count, stops200m.Count, stops400m.Count, stops600m.Count);
+
+			// IMPORTANT: Apply the current filter using the new incremental adaptation logic.
+			if (_stopsNearby.Count > 0 && _currentDistanceFilter != DistanceFilter.All)
+			{
+				_logger.LogInformation("UpdateNearbyStops: Calling AdaptDisplayedStopsToFilterAsync for filter {filter}", _currentDistanceFilter);
+				await AdaptDisplayedStopsToFilterAsync(_currentDistanceFilter);
+			}
+			else if (_currentDistanceFilter == DistanceFilter.All)
+            {
+                _logger.LogInformation("UpdateNearbyStops: Current filter is ALL. The UI will be populated by OnDistanceFilterClicked or OnAppearing via LoadAllRoutesWithVirtualization.");
+                // If this method is called (e.g., from OnAppearing after location update) and the filter is ALL,
+                // AdaptDisplayedStopsToFilterAsync itself handles calling LoadAllRoutesWithVirtualization.
+                // So, we can also call it here to be safe, or rely on its internal handling for ALL.
+                await AdaptDisplayedStopsToFilterAsync(DistanceFilter.All); 
+            }
+			else
+			{
+				_logger.LogInformation("UpdateNearbyStops: No nearby stops found or filter is ALL. Clearing/showing no routes.");
+                // If no stops nearby but a distance filter is selected, clear the list.
+                if (_currentDistanceFilter != DistanceFilter.All)
+                {
+                    await MainThread.InvokeOnMainThreadAsync(() => 
+                    {
+                        this.Routes.Clear();
+                        var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
+                        if (noRoutesLabel != null)
+                        {
+                            noRoutesLabel.Text = $"No stops found within {_currentDistanceFilter.ToString().Replace("Meters", "")}m of your location.";
+                            noRoutesLabel.IsVisible = true;
+                        }
+                    });
+                }
+			}
+			
+			// Always clear the refresh indicator when done
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
 		}
-
-		// Store the results - with ordering by distance
-		_stopsNearby["100m"] = stops100m.ToList().OrderBy(s => s.DistanceFromUser).ToList();
-		_stopsNearby["200m"] = stops200m.ToList().OrderBy(s => s.DistanceFromUser).ToList();
-		_stopsNearby["400m"] = stops400m.ToList().OrderBy(s => s.DistanceFromUser).ToList();
-		_stopsNearby["600m"] = stops600m.ToList().OrderBy(s => s.DistanceFromUser).ToList();
-
-		stopwatch.Stop();
-		_logger.LogDebug("Found nearby stops: 100m={0}, 200m={1}, 400m={2}, 600m={3} in {4}ms",
-			stops100m.Count, stops200m.Count, stops400m.Count, stops600m.Count, stopwatch.ElapsedMilliseconds);
-
-		// Pre-cache routes for each distance filter
-		// This is a major optimization to make filter switching instant
-		_ = Task.Run(async () => {
-			try
-			{
-				// First, process the current filter
-				if (_currentDistanceFilter != DistanceFilter.All && _stopsNearby.Count > 0)
-				{
-					string currentKey = GetDistanceKeyForFilter(_currentDistanceFilter);
-					if (!string.IsNullOrEmpty(currentKey) && _stopsNearby.ContainsKey(currentKey) && !_stopGroupsCache.ContainsKey(_currentDistanceFilter))
-					{
-						// Process current filter first
-						var currentStops = _stopsNearby[currentKey];
-						var currentGroups = await PreloadFilteredStopGroupsAsync(currentStops);
-						_stopGroupsCache[_currentDistanceFilter] = currentGroups;
-						_logger.LogInformation("Pre-cached {count} stop groups for current filter {filter}", 
-							currentGroups.Count, _currentDistanceFilter);
-						
-						// Apply current filter to UI if needed
-						await AdaptDisplayedStopsToFilterAsync(_currentDistanceFilter);
-					}
-					else
-					{
-						// Apply current filter if already cached
-						await AdaptDisplayedStopsToFilterAsync(_currentDistanceFilter);
-					}
-					
-					// Now pre-cache other filters in the background
-					foreach (var filter in Enum.GetValues(typeof(DistanceFilter)).Cast<DistanceFilter>())
-					{
-						// Skip All filter and current filter
-						if (filter == DistanceFilter.All || filter == _currentDistanceFilter || _stopGroupsCache.ContainsKey(filter))
-							continue;
-							
-						string key = GetDistanceKeyForFilter(filter);
-						if (!string.IsNullOrEmpty(key) && _stopsNearby.ContainsKey(key))
-						{
-							var filterStops = _stopsNearby[key];
-							var filterGroups = await PreloadFilteredStopGroupsAsync(filterStops);
-							_stopGroupsCache[filter] = filterGroups;
-							_logger.LogDebug("Background pre-cached {count} stop groups for filter {filter}", 
-								filterGroups.Count, filter);
-						}
-					}
-				}
-				else if (_currentDistanceFilter == DistanceFilter.All)
-				{
-					_logger.LogInformation("UpdateNearbyStops: Current filter is ALL. The UI will be populated by OnDistanceFilterClicked or OnAppearing.");
-					await AdaptDisplayedStopsToFilterAsync(DistanceFilter.All);
-				}
-				else
-				{
-					_logger.LogWarning("UpdateNearbyStops: No stops found or filter is invalid.");
-					await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
-				}
-			}
-			catch (Exception ex)
-			{
-				_logger.LogError(ex, "Error pre-caching filters");
-				await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
-			}
-		});
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error updating nearby stops");
+			// Make sure to clear the refresh indicator in case of error
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
+		}
 	}
 
 	/// <summary>
@@ -2176,11 +2087,11 @@ public partial class MainPage : ContentPage
 				var previousFilter = _currentDistanceFilter;
 				_currentDistanceFilter = newFilter;
 				
+				// Clear cache to ensure fresh data
+				_stopGroupsCache.Clear();
+				
 				// Immediately update button colors to provide visual feedback
 				UpdateDistanceFilterButtonColors();
-				
-				// Don't clear the cache at all - reuse all cached data
-				// This is different from previous version that removed the filter cache
 				
 				// Toggle visibility of views based on the selected filter
 				bool isNearbyFilter = newFilter != DistanceFilter.All;
@@ -2208,289 +2119,110 @@ public partial class MainPage : ContentPage
 					FontSize = 14
 				};
 				
-				// Start the operation immediately
-				Task.Run(async () =>
+				StackLayout loadingStack = new StackLayout
 				{
-					try
+					HorizontalOptions = LayoutOptions.Center,
+					VerticalOptions = LayoutOptions.Center,
+					Spacing = 5,
+					Children = { loadingIndicator, loadingLabel }
+				};
+				
+				// Get the appropriate collection view based on the selected filter
+				CollectionView? collectionView = isNearbyFilter 
+					? this.FindByName<CollectionView>("NearbyRoutesCollection")
+					: this.FindByName<CollectionView>("AllRoutesCollection");
+					
+				if (collectionView != null && collectionView.Parent is Grid grid)
+				{
+					// Clear any existing routes to prevent UI freeze from rendering old content
+					if (newFilter == DistanceFilter.All)
 					{
-						// Show a loading indicator immediately before any processing
-						await MainThread.InvokeOnMainThreadAsync(() => 
+						// Create empty collection to avoid freezing while clearing
+						var emptyCollection = new ObservableRangeCollection<object>();
+						Routes = emptyCollection;
+					}
+					else if (previousFilter == DistanceFilter.All)
+					{
+						// When switching from All to a distance filter, create an empty collection
+						// to avoid rendering delays when the view is about to be hidden anyway
+						var emptyCollection = new ObservableRangeCollection<object>();
+						Routes = emptyCollection;
+					}
+					
+					// Suspend any animation to reduce UI workload
+					Microsoft.Maui.Controls.VisualStateManager.GoToState(collectionView, "NotAnimating");
+					
+					// Add the indicator at the center of the collection view
+					grid.Add(loadingStack);
+					
+					Grid.SetRow(loadingStack, Grid.GetRow(collectionView));
+					Grid.SetColumn(loadingStack, Grid.GetColumn(collectionView));
+					
+					// Show progress indicator but don't block UI with refresh indicator
+					loadingStack.IsVisible = true;
+				}
+				
+				// Very important: Let UI update before starting expensive operations
+				// This prevents the UI freeze when the user taps the button
+				Dispatcher.DispatchDelayed(TimeSpan.FromMilliseconds(50), () =>
+				{
+					// Apply the filter in the background to keep UI responsive
+					_ = Task.Run(async () => 
+					{
+						try 
 						{
-							loadingIndicator.IsVisible = true;
-							loadingLabel.IsVisible = true;
-						});
-						
-						// For distance filters, start by checking the cache
-						if (newFilter != DistanceFilter.All)
-						{
-							// Set a blank placeholder list immediately to clear old data
-							// This prevents visual glitches and makes the UI feel responsive
-							await MainThread.InvokeOnMainThreadAsync(() => 
+							if (isNearbyFilter)
 							{
-								// Create a temporary empty collection for immediate display
-								var tempCollection = new ObservableRangeCollection<object>();
-								Routes = tempCollection;
-							});
-							
-							if (_stopGroupsCache.ContainsKey(newFilter))
+								// This will ensure location is fresh if needed, then call UpdateNearbyStops with the new _currentDistanceFilter.
+								// UpdateNearbyStops will then trigger the new data pipeline (ApplyDistanceFilterWithoutEtasAsync -> UpdateEtasForCurrentView).
+								await UpdateUserLocationIfNeeded();
+							}
+							else
 							{
-								// If we have a cached result, use it immediately
-								var cachedResult = _stopGroupsCache[newFilter];
-								_logger?.LogInformation("Using cached filter result for {filter} with {count} items", newFilter, cachedResult.Count);
+								// For ALL filter - use revised approach that's optimized to prevent UI freezing
 								
+								// First, apply a small initial set (~20 routes) immediately for fast feedback
+								var initialRoutes = _allRoutes.Take(20).Cast<object>().ToList();
 								await MainThread.InvokeOnMainThreadAsync(() => 
 								{
-									Routes = cachedResult;
-									loadingIndicator.IsVisible = false;
-									loadingLabel.IsVisible = false;
+									var newCollection = new ObservableRangeCollection<object>();
+									newCollection.BeginBatch();
+									newCollection.AddRange(initialRoutes);
+									newCollection.EndBatch();
+									Routes = newCollection;
 								});
-								return; // Exit early with cached data
-							}
-							
-							// Fast path: if we already have the stops for this filter cached
-							// and also have route data for them, rebuild the view instantly
-							string distanceKey = GetDistanceKeyForFilter(newFilter);
-							if (!string.IsNullOrEmpty(distanceKey) && _stopsNearby.ContainsKey(distanceKey) && _stopsNearby[distanceKey].Count > 0)
-							{
-								_logger?.LogInformation("Using fast path for filter {filter} with {count} cached stops", 
-                                    newFilter, _stopsNearby[distanceKey].Count);
 								
-								// Get stops for the selected filter
-								var stopsForFilter = _stopsNearby[distanceKey];
-								
-								// Instant UI update with stops only (no ETAs yet)
-								var quickResult = await PreloadFilteredStopGroupsAsync(stopsForFilter);
-								
-								if (quickResult.Count > 0)
-								{
-									// Update UI immediately with the quick result
-									await MainThread.InvokeOnMainThreadAsync(() => 
-									{
-										Routes = quickResult;
-										loadingIndicator.IsVisible = false;
-										loadingLabel.IsVisible = false;
-										
-										// Cache this result
-										_stopGroupsCache[newFilter] = quickResult;
-									});
-									
-									// First clean up any invalid ETAs that might be cached
-									await CleanupEmptyStopGroupsFromViewAsync();
-									
-									// Then fetch ETAs asynchronously without blocking UI
-									_ = Task.Run(async () => 
-									{
-										await UpdateEtasForCurrentView(quickResult);
-									});
-									
-									return; // Exit early with quick data + async ETAs
-								}
+								// Then load the rest in background with optimized batching
+								await LoadAllRoutesWithVirtualization();
 							}
 						}
-						
-						// If there's no fast path, use the regular approach
-						if (newFilter == DistanceFilter.All)
+						catch (Exception ex)
 						{
-							// For ALL, use the virtualized loading approach
-							await MainThread.InvokeOnMainThreadAsync(() => {
-								// Empty the list first to show loading
-								Routes.Clear();
-							});
-							
-							await LoadAllRoutesWithVirtualization();
-							
-							// Hide loading indicators when done
-							await MainThread.InvokeOnMainThreadAsync(() => {
-								loadingIndicator.IsVisible = false;
-								loadingLabel.IsVisible = false;
-							});
+							_logger?.LogError(ex, "Error applying distance filter: {message}", ex.Message);
 						}
-						else
+						finally 
 						{
-							// Try to quickly rebuild the view from stops
-							string distanceKey = GetDistanceKeyForFilter(newFilter);
-							if (!string.IsNullOrEmpty(distanceKey) && _stopsNearby.ContainsKey(distanceKey))
+							// Remove loading indicator when done
+							await MainThread.InvokeOnMainThreadAsync(() => 
 							{
-								// Create immediate display from cached stops
-								var stops = _stopsNearby[distanceKey];
-								
-								if (stops.Count > 0)
+								if (collectionView != null && collectionView.Parent is Grid parentGrid && loadingStack.Parent == parentGrid)
 								{
-									_logger?.LogInformation("Generating new stop groups for {count} stops in filter {filter}", 
-										stops.Count, newFilter);
-										
-									// Get all stop groups ready
-									var result = await PreloadFilteredStopGroupsAsync(stops);
-									
-									// Update UI immediately
-									await MainThread.InvokeOnMainThreadAsync(() => {
-										Routes = result;
-										_stopGroupsCache[newFilter] = result; // Cache for future use
-										loadingIndicator.IsVisible = false;
-										loadingLabel.IsVisible = false;
-									});
-									
-									// Clean up any invalid ETAs
-									await CleanupEmptyStopGroupsFromViewAsync();
-									
-									// Fetch ETAs in background
-									_ = Task.Run(async () => {
-										await UpdateEtasForCurrentView(result);
-									});
-									
-									return;
+									parentGrid.Remove(loadingStack);
 								}
-							}
-							
-							// Fallback to adaptiveDisplayed approach if fast rebuild fails
-							await AdaptDisplayedStopsToFilterAsync(newFilter);
-							
-							// Clean up any invalid ETAs
-							await CleanupEmptyStopGroupsFromViewAsync();
-							
-							// Hide loading indicators when done
-							await MainThread.InvokeOnMainThreadAsync(() => {
-								loadingIndicator.IsVisible = false;
-								loadingLabel.IsVisible = false;
+								
+								// Resume animations
+								if (collectionView != null)
+								{
+									Microsoft.Maui.Controls.VisualStateManager.GoToState(collectionView, "Normal");
+								}
 							});
 						}
-					}
-					catch (Exception ex)
-					{
-						_logger?.LogError(ex, "Error applying filter: {message}", ex.Message);
-					}
+					});
 				});
 			}
 		}
 	}
-
-	// Helper method to get distance key string from filter enum
-	private string GetDistanceKeyForFilter(DistanceFilter filter)
-	{
-		switch (filter)
-		{
-			case DistanceFilter.Meters100: return "100m";
-			case DistanceFilter.Meters200: return "200m";
-			case DistanceFilter.Meters400: return "400m";
-			case DistanceFilter.Meters600: return "600m";
-			default: return string.Empty;
-		}
-	}
 	
-	// Pre-loads stop groups for immediate display without ETAs
-	private async Task<ObservableRangeCollection<object>> PreloadFilteredStopGroupsAsync(List<TransportStop> stops)
-	{
-		var result = new ObservableRangeCollection<object>();
-		
-		if (stops == null || stops.Count == 0)
-		{
-			return result;
-		}
-		
-		// Log what we're doing
-		_logger?.LogDebug("PreloadFilteredStopGroupsAsync: Processing {count} stops", stops.Count);
-		
-		// Process stops in background to avoid UI blocking
-		var stopGroups = new List<StopGroup>();
-		var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-		
-		try
-		{
-			// Optimize: check if we already have route data cached for the stops
-			// Process in parallel for faster loading
-			var tasks = stops.Select(async stop => 
-			{
-				try 
-				{
-					// Get routes for this stop from database
-					var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
-					
-					// Apply text search filter if needed
-					if (!string.IsNullOrEmpty(_searchQuery))
-					{
-						routesForStop = routesForStop.Where(r => 
-							r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
-					}
-					
-					// If this stop has routes after filtering, create a StopGroup
-					if (routesForStop.Any())
-					{
-						return new StopGroup(
-							stop,
-							routesForStop.OrderBy(r => r.RouteNumber).ToList(),
-							stop.DistanceFromUser
-						);
-					}
-					
-					return null;
-				}
-				catch (Exception ex)
-				{
-					_logger?.LogError(ex, "Error loading routes for stop {stopId}", stop.Id);
-					return null;
-				}
-			}).ToArray();
-			
-			// Wait for all tasks to complete
-			await Task.WhenAll(tasks);
-			
-			// Add non-null results to stop groups
-			stopGroups.AddRange(tasks.Select(t => t.Result).Where(sg => sg != null));
-		}
-		catch (Exception ex)
-		{
-			_logger?.LogError(ex, "Error in parallel stop processing");
-			
-			// Fallback to sequential processing if parallel fails
-			foreach (var stop in stops)
-			{
-				try
-				{
-					// Get routes for this stop from database
-					var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
-					
-					// Apply text search filter if needed
-					if (!string.IsNullOrEmpty(_searchQuery))
-					{
-						routesForStop = routesForStop.Where(r => 
-							r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
-					}
-					
-					// If this stop has routes after filtering, create a StopGroup
-					if (routesForStop.Any())
-					{
-						var group = new StopGroup(
-							stop,
-							routesForStop.OrderBy(r => r.RouteNumber).ToList(),
-							stop.DistanceFromUser
-						);
-						
-						stopGroups.Add(group);
-					}
-				}
-				catch (Exception stopEx)
-				{
-					_logger?.LogError(stopEx, "Error loading routes for stop {stopId}", stop.Id);
-				}
-			}
-		}
-		
-		stopwatch.Stop();
-		
-		// Sort groups by distance
-		stopGroups = stopGroups.OrderBy(sg => sg.DistanceInMeters).ToList();
-		
-		_logger?.LogInformation("PreloadFilteredStopGroupsAsync: Created {count} stop groups in {elapsed}ms", 
-			stopGroups.Count, stopwatch.ElapsedMilliseconds);
-		
-		// Add to result collection
-		result.BeginBatch();
-		result.AddRange(stopGroups);
-		result.EndBatch();
-		
-		return result;
-	}
-
 	/// <summary>
 	/// Applies the selected distance filter asynchronously
 	/// </summary>
@@ -2531,14 +2263,30 @@ public partial class MainPage : ContentPage
 			// Check if we have a cached result - use it immediately to prevent UI blocking
 			if (_stopGroupsCache.ContainsKey(filter) && string.IsNullOrEmpty(_searchQuery))
 			{
-				_logger?.LogInformation("Using cached results for filter {filter}", filter);
 				return _stopGroupsCache[filter];
 			}
 			
+			// Always use full processing for distance filter changes
+			// Regular full processing without triggering data downloads
 			// Get the list of nearby stops for the selected distance
 			List<TransportStop> nearbyStops = new List<TransportStop>();
 			
-			string distanceKey = GetDistanceKeyForFilter(filter);
+			string distanceKey = "";
+			switch (filter)
+			{
+				case DistanceFilter.Meters100:
+					distanceKey = "100m";
+					break;
+				case DistanceFilter.Meters200:
+					distanceKey = "200m";
+					break;
+				case DistanceFilter.Meters400:
+					distanceKey = "400m";
+					break;
+				case DistanceFilter.Meters600:
+					distanceKey = "600m";
+					break;
+			}
 			
 			// Safely get stops for the selected distance
 			if (!string.IsNullOrEmpty(distanceKey) && _stopsNearby.ContainsKey(distanceKey))
@@ -2546,21 +2294,211 @@ public partial class MainPage : ContentPage
 				nearbyStops = _stopsNearby[distanceKey];
 			}
 			
-			// Use the preload method to get initial display faster
-			var filteredItems = await PreloadFilteredStopGroupsAsync(nearbyStops);
+			// Prepare UI update in a separate step
+			ObservableRangeCollection<object> filteredItems = new ObservableRangeCollection<object>();
+			int totalRoutes = 0;
+			string noRoutesText = string.Empty;
 			
-			// Cache the result
-			if (!string.IsNullOrEmpty(_searchQuery))
+			// If no nearby stops found, show empty list
+			if (nearbyStops.Count == 0)
+			{
+				noRoutesText = $"No stops found within {filter.ToString().Replace("Meters", "")} of your location.";
+			}
+			else
+			{
+				// Process the stop groups in background to avoid UI blocking
+				await Task.Run(async () => {
+					// Process all of the stop data off the UI thread to avoid blocking
+					var stopGroups = new List<StopGroup>();
+					
+					// Get a list of stop IDs for batch processing
+					var stopIds = nearbyStops.Select(s => s.Id).ToList();
+					
+					// Create dictionary to avoid UI updates during processing
+					var routesByStopId = new Dictionary<string, List<TransportRoute>>();
+					
+					// Process all stops in a single batch first
+					foreach (var stop in nearbyStops)
+					{
+						// Get routes for this stop from database
+						var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
+						
+						// Apply text search filter if needed
+						if (!string.IsNullOrEmpty(_searchQuery))
+						{
+							routesForStop = routesForStop.Where(r => 
+								r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
+						}
+						
+						// If this stop has matching routes, process it
+						if (routesForStop.Any())
+						{
+							routesByStopId[stop.Id] = routesForStop.OrderBy(r => r.RouteNumber).ToList();
+							totalRoutes += routesForStop.Count;
+						}
+					}
+					
+					// Now create the stop groups with distances - all calculated off the UI thread
+					foreach (var stop in nearbyStops)
+					{
+						if (!routesByStopId.ContainsKey(stop.Id)) continue;
+						
+						// Calculate distance from user to this stop
+						var stopLocation = new Location(stop.Latitude, stop.Longitude);
+						double distanceInMeters = Location.CalculateDistance(_userLocation, stopLocation, DistanceUnits.Kilometers) * 1000;
+						
+						// Get the sorted routes
+						var sortedRoutes = routesByStopId[stop.Id];
+						
+						// Create and add a StopGroup object
+						var stopGroup = new StopGroup(
+							stop, 
+							sortedRoutes, 
+							distanceInMeters);
+						
+						stopGroups.Add(stopGroup);
+					}
+					
+					// Sort all stop groups by distance
+					stopGroups = stopGroups.OrderBy(sg => sg.DistanceInMeters).ToList();
+					
+					// First batch: Fetch ETAs in parallel for the first batch of stop groups
+					var etaTasks = new List<Task>();
+					const int initialBatchSize = 5; // Process first 5 stop groups with ETAs
+					
+					for (int i = 0; i < Math.Min(initialBatchSize, stopGroups.Count); i++)
+					{
+						etaTasks.Add(FetchAndApplyEtasForStopGroup(stopGroups[i]));
+					}
+					
+					// Wait for all initial ETA fetches to complete
+					await Task.WhenAll(etaTasks);
+					
+					// Update UI with first batch
+					await MainThread.InvokeOnMainThreadAsync(() => {
+						filteredItems.BeginBatch();
+						for (int i = 0; i < Math.Min(initialBatchSize, stopGroups.Count); i++)
+						{
+							// Only add stop groups that have at least one route with a valid ETA
+							// if (stopGroups[i].HasAnyVisibleRoutesWithEta)
+							// {
+							//	filteredItems.Add(stopGroups[i]);
+							// }
+                            // Always add the stop group if it exists; ETAs will populate it.
+                            if (stopGroups[i] != null && stopGroups[i].Routes.Any())
+                            {
+                                filteredItems.Add(stopGroups[i]);
+                            }
+						}
+						filteredItems.EndBatch();
+					});
+					
+					// Process remaining items in background
+					if (stopGroups.Count > initialBatchSize)
+					{
+						// Create batches for remaining stop groups
+						var remainingGroups = stopGroups.Skip(initialBatchSize).ToList();
+						const int batchSize = 5;
+						
+						for (int i = 0; i < remainingGroups.Count; i += batchSize)
+						{
+							var batch = remainingGroups.Skip(i).Take(batchSize).ToList();
+							var batchTasks = batch.Select(sg => FetchAndApplyEtasForStopGroup(sg));
+							
+							// Process batch in parallel
+							await Task.WhenAll(batchTasks);
+							
+							// Update UI with this batch
+							// var validGroups = batch.Where(sg => sg.HasAnyVisibleRoutesWithEta).ToList();
+							// if (validGroups.Any())
+							// {
+                            // Always add groups that have routes.
+                            var groupsToAdd = batch.Where(sg => sg != null && sg.Routes.Any()).ToList();
+                            if (groupsToAdd.Any())
+                            {
+								await MainThread.InvokeOnMainThreadAsync(() => {
+									filteredItems.BeginBatch();
+									foreach (var group in groupsToAdd) // Changed from validGroups
+									{
+										filteredItems.Add(group);
+									}
+									filteredItems.EndBatch();
+								});
+							}
+							
+							// Small delay between batches for UI responsiveness
+							await Task.Delay(20);
+						}
+					}
+				});
+				
+				if (filteredItems.Count == 0) // Check filteredItems (StopGroups) count
+				{
+					noRoutesText = $"No routes found within {filter.ToString().Replace("Meters", "")} of your location.";
+				}
+				
+				_logger?.LogDebug("Found {0} routes from {1} stops near current location within {2}",
+					totalRoutes, filteredItems.Count, filter.ToString().Replace("Meters", ""));
+			}
+
+			// Cache the results if no search query is applied
+			if (string.IsNullOrEmpty(_searchQuery))
 			{
 				_stopGroupsCache[filter] = filteredItems;
 			}
 			
-			// Return the result immediately
+			// Update UI on the main thread - all at once to avoid multiple renders
+			await MainThread.InvokeOnMainThreadAsync(() => 
+			{
+				try 
+				{
+					// Find label by name rather than directly referencing it
+					var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
+					
+					if (noRoutesLabel != null)
+					{
+						if (string.IsNullOrEmpty(_searchQuery) == false && filteredItems.Count == 0)
+						{
+							noRoutesLabel.Text = $"No routes matching '{_searchQuery}' found within {filter.ToString().Replace("Meters", "")} of your location.";
+						}
+						else if (filteredItems.Count == 0)
+						{
+							noRoutesLabel.Text = $"No stops found within {filter.ToString().Replace("Meters", "")} of your location.";
+						}
+					}
+					
+					// Optimize collection view rendering when large data is displayed
+					var performanceOptimizer = Handler?.MauiContext?.Services?.GetService<PerformanceOptimizer>();
+					performanceOptimizer?.OptimizeForLargeDataset(true);
+					
+					// IMPORTANT: Force UI update for current view
+					var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+					if (collectionView != null)
+					{
+						// Force collection view to update its ItemsSource
+						collectionView.ItemsSource = null;
+						collectionView.ItemsSource = filteredItems;
+					}
+					
+					// Store current filter as previous for next update
+					_previousDistanceFilter = filter;
+				}
+				catch (Exception ex)
+				{
+					_logger?.LogError(ex, "Error updating UI after distance filter: {message}", ex.Message);
+				}
+			});
+			
 			return filteredItems;
 		}
 		catch (Exception ex)
 		{
-			_logger?.LogError(ex, "Error in ApplyDistanceFilterAsync: {Message}", ex.Message);
+			_logger?.LogError(ex, "Error in ApplyDistanceFilterAsync: {message}", ex.Message);
+			
+			// Ensure we still show an alert even if the UI update fails
+			await DisplayAlert("Error", "Could not apply distance filter.", "OK");
+			
+			// Return empty collection on error
 			return new ObservableRangeCollection<object>();
 		}
 	}
@@ -3621,9 +3559,6 @@ public partial class MainPage : ContentPage
 				_isUpdatingEtas = true;
 			}
 			
-			// First clean up any invalid ETAs from previous updates
-			await CleanupEmptyStopGroupsFromViewAsync();
-			
 			// Store initial state of routes count - if we have items, don't show progress indicator
 			bool hasExistingRoutes = Routes != null && Routes.Count > 0;
 			
@@ -3814,30 +3749,6 @@ public partial class MainPage : ContentPage
 			{
 				_logger?.LogInformation("[MainThread Cleanup] Inspecting StopGroups before removal. Total items in Routes: {TotalCount}", currentRoutesCollection.Count);
 				
-				DateTime now = DateTime.Now;
-				
-				// First hide invalid routes (ETAs that are past)
-				var allStopGroups = currentRoutesCollection.OfType<StopGroup>().ToList();
-				foreach (var stopGroup in allStopGroups)
-				{
-					if (stopGroup.Routes == null) continue;
-					
-					// Check each route for valid ETAs
-					foreach (var route in stopGroup.Routes.ToList())
-					{
-						// Mark routes with ETAs over 1 minute in the past as having no ETA
-						if (route.NextEta != null && route.NextEta.EtaTime < now.AddSeconds(-60))
-						{
-							route.FirstEta = string.Empty; // Clear ETA display
-							route.NextEta = null; // Remove the invalid ETA
-							route.Etas.Clear(); // Clear all ETAs for this route
-							_logger?.LogDebug("[ETA Cleanup] Cleared invalid past ETA for route {route} at stop {stop}", 
-								route.RouteNumber, stopGroup.Stop.LocalizedName);
-						}
-					}
-				}
-				
-				// Then remove stop groups with no valid ETAs
 				var groupsToRemove = currentRoutesCollection.OfType<StopGroup>()
 												.Where(sg => !sg.HasAnyVisibleRoutesWithEta) // Use the property as intended
 												.ToList();
@@ -5451,7 +5362,6 @@ public class PerformanceOptimizer
 // Add this class after the StopGroup class but before the MainPage class
 
 // Simple class to show loading progress
-
 
 
 
