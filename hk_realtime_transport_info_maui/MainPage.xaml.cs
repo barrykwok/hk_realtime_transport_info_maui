@@ -3188,24 +3188,113 @@ public partial class MainPage : ContentPage
 			else // ETAs are present and the list is not empty
 			{
 				var updates = new List<Tuple<TransportRoute, TransportEta?, List<TransportEta>>>();
-				var etasByRouteKey = allEtasFromApi
-					.GroupBy(e => new { e.RouteNumber, e.ServiceType, e.Direction }) 
-					.ToDictionary(g => g.Key, g => g.ToList());
+				
+				// Create different dictionaries for matching ETAs based on operator
+				Dictionary<object, List<TransportEta>> etasByRouteKey;
+				
+				if (stopGroup.Stop.Operator == TransportOperator.MTR)
+				{
+					// For MTR, use a simpler matching approach with just the route number
+					etasByRouteKey = allEtasFromApi
+						.GroupBy(e => e.RouteNumber)
+						.ToDictionary(g => (object)g.Key, g => g.ToList());
+					_logger?.LogDebug("Created MTR ETA dictionary with {count} route keys for stop {stopId}", 
+						etasByRouteKey.Count, stopIdForLog);
+				}
+				else
+				{
+					// For other operators, use the more specific key
+					etasByRouteKey = allEtasFromApi
+						.GroupBy(e => new { e.RouteNumber, e.ServiceType, e.Direction }) 
+						.ToDictionary(g => (object)g.Key, g => g.ToList());
+				}
 
+				// Track which route keys we process to identify new routes with ETAs later
+				HashSet<object> processedRouteKeys = new HashSet<object>();
+				
 				if (stopGroup.Routes != null)
 				{
 					foreach (var route in stopGroup.Routes) 
 					{
 						if (route == null) continue;
-						var key = new { route.RouteNumber, route.ServiceType, Direction = route.Bound };
-						if (etasByRouteKey.TryGetValue(key, out var etasForRoute) && etasForRoute.Any())
+						
+						bool foundEta = false;
+						List<TransportEta>? etasForRoute = null;
+						
+						if (route.Operator == TransportOperator.MTR)
 						{
-							var firstEta = etasForRoute.OrderBy(e => e.EtaTime).FirstOrDefault();
-							updates.Add(Tuple.Create(route, firstEta, etasForRoute));
+							// For MTR routes, match just by route number
+							if (etasByRouteKey.TryGetValue(route.RouteNumber, out etasForRoute) && etasForRoute.Any())
+							{
+								var firstEta = etasForRoute.OrderBy(e => e.EtaTime).FirstOrDefault();
+								updates.Add(Tuple.Create(route, firstEta, etasForRoute));
+								processedRouteKeys.Add(route.RouteNumber);
+								foundEta = true;
+								_logger?.LogDebug("Found ETAs for MTR route {routeNumber} at stop {stopName}", 
+									route.RouteNumber, stopGroup.Stop.LocalizedName);
+							}
 						}
 						else
 						{
+							// For other operators, use the more specific key
+							var key = new { route.RouteNumber, route.ServiceType, Direction = route.Bound };
+							if (etasByRouteKey.TryGetValue(key, out etasForRoute) && etasForRoute.Any())
+							{
+								var firstEta = etasForRoute.OrderBy(e => e.EtaTime).FirstOrDefault();
+								updates.Add(Tuple.Create(route, firstEta, etasForRoute));
+								processedRouteKeys.Add(key);
+								foundEta = true;
+							}
+						}
+						
+						if (!foundEta)
+						{
 							updates.Add(Tuple.Create(route, (TransportEta?)null, new List<TransportEta>()));
+						}
+					}
+				}
+				
+				// For MTR stops, check if there are any routes with ETAs that aren't in the stop group yet
+				List<TransportRoute> newRoutesToAdd = new List<TransportRoute>();
+				
+				if (stopGroup.Stop.Id.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+				{
+					foreach (var kvp in etasByRouteKey)
+					{
+						// Skip routes we've already processed
+						if (processedRouteKeys.Contains(kvp.Key))
+							continue;
+							
+						var routeKey = kvp.Key;
+						var etasForRoute = kvp.Value;
+						
+						if (etasForRoute.Any() && !string.IsNullOrEmpty(etasForRoute[0].RouteId))
+						{
+							// Get this route from the database
+							var route = await _databaseService.GetRouteByIdAsync(etasForRoute[0].RouteId);
+							if (route != null)
+							{
+								// Add it to our list of routes to add to the stop group
+								var firstEta = etasForRoute.OrderBy(e => e.EtaTime).FirstOrDefault();
+								route.NextEta = firstEta;
+								route.Etas = etasForRoute;
+								
+								// Calculate and set the FirstEta display value
+								if (firstEta != null)
+								{
+									TimeSpan timeDiff = firstEta.EtaTime - DateTime.Now;
+									if (timeDiff.TotalMinutes <= 0)
+										route.FirstEta = "Arrived";
+									else if (timeDiff.TotalMinutes < 1)
+										route.FirstEta = "Arriving";
+									else
+										route.FirstEta = $"{(int)Math.Floor(timeDiff.TotalMinutes)} min";
+								}
+								
+								newRoutesToAdd.Add(route);
+								_logger?.LogDebug("Found MTR route {routeNumber} for stop {stopName} based on valid ETAs", 
+									route.RouteNumber, stopGroup.Stop.LocalizedName);
+							}
 						}
 					}
 				}
@@ -3230,6 +3319,19 @@ public partial class MainPage : ContentPage
 								{
 									atLeastOneRouteInGroupGotEtaThisTime = true;
 								}
+							}
+							
+							// Add any new MTR routes with valid ETAs
+							foreach (var newRoute in newRoutesToAdd)
+							{
+								stopGroup.Routes.Add(newRoute);
+								atLeastOneRouteInGroupGotEtaThisTime = true;
+							}
+							
+							if (newRoutesToAdd.Count > 0)
+							{
+								_logger?.LogInformation("Added {count} new MTR routes to stop {stopName} based on valid ETAs",
+									newRoutesToAdd.Count, stopGroup.Stop.LocalizedName);
 							}
 						}
 						// The StopGroup's HasEtas property should update based on its internal logic
@@ -3300,7 +3402,7 @@ public partial class MainPage : ContentPage
 			{
 				_logger?.LogDebug("Using cached ETAs for stop: {stopId}", stopGroup.Stop.StopId);
 				var cachedEtas = await _etaService.GetCachedEtas(stopGroup.Stop.StopId);
-				await ApplyEtasToStopGroupAsync(stopGroup, cachedEtas);
+				await ApplyEtasToStopGroupVoidAsync(stopGroup, cachedEtas);
 				return;
 			}
 				
@@ -3370,7 +3472,7 @@ public partial class MainPage : ContentPage
 			}
 			
 			// Apply the filtered ETAs to the stop group
-			await ApplyEtasToStopGroupAsync(stopGroup, filteredEtas);
+			await ApplyEtasToStopGroupVoidAsync(stopGroup, filteredEtas);
 		}
 		catch (Exception ex)
 		{
@@ -3451,6 +3553,7 @@ public partial class MainPage : ContentPage
 								
 								foreach (var group in relatedOriginalGroups)
 								{
+									// The Task<bool> version is fine here since we need the return value
 									bool isActive = await ApplyEtasToStopGroupAsync(group, etas);
 									groupActivityStatus[group.Stop.Id] = groupActivityStatus.ContainsKey(group.Stop.Id) ? groupActivityStatus[group.Stop.Id] || isActive : isActive;
 								}
@@ -4665,9 +4768,14 @@ public partial class MainPage : ContentPage
                                 // Assuming FetchAllKmbEtaForStopOptimized returns List<Models.TransportEta>
                                 etas = await _etaService.FetchAllKmbEtaForStopOptimized(newStopGroup.Stop.Id);
                             }
+                            else if (newStopGroup.Stop.Operator == TransportOperator.MTR)
+                            {
+                                // Fetch MTR ETAs
+                                etas = await _etaService.FetchAllMtrEtaForStop(newStopGroup.Stop.Id);
+                            }
                             // Add other operators as needed
 
-                            // Apply the fetched ETAs and get the status
+                            // Apply the fetched ETAs and get the status - using the boolean-returning version
                             bool anyRouteGotEta = await ApplyEtasToStopGroupAsync(newStopGroup, etas);
                             return (newStopGroup, anyRouteGotEta);
                         }));
@@ -4677,25 +4785,33 @@ public partial class MainPage : ContentPage
 
 					foreach (var result in groupActivityResults)
                     {
-                        if (result.isActive && result.group != null)
+                        // Always include MTR stops even if they don't have ETAs
+                        if (result.group != null && (result.isActive || result.group.Stop.Operator == TransportOperator.MTR))
                         {
-                            // Get the original route collection from the StopGroup
-                            var originalRoutesInGroup = result.group.Routes; // This is an ObservableCollection<TransportRoute>
-                            
-                            var routesWithEta = originalRoutesInGroup.Where(r => r.HasEta).ToList();
-                            
-                            if (routesWithEta.Any())
+                            // For MTR stops, we want to include them even without ETAs
+                            if (result.group.Stop.Operator == TransportOperator.MTR)
                             {
-                                // Update the original collection in the StopGroup
-                                originalRoutesInGroup.Clear();
-                                foreach (var routeToAdd in routesWithEta)
-                                {
-                                    originalRoutesInGroup.Add(routeToAdd);
-                                }
                                 newActiveStopGroupsReadyForUi.Add(result.group);
                             }
-                            // If routesWithEta is empty, the group (and its now empty Routes collection)
-                            // will not be added to newActiveStopGroupsReadyForUi, effectively filtering it out.
+                            // For other operators, only include if they have ETAs
+                            else if (result.isActive)
+                            {
+                                // Get the original route collection from the StopGroup
+                                var originalRoutesInGroup = result.group.Routes; // This is an ObservableCollection<TransportRoute>
+                                
+                                var routesWithEta = originalRoutesInGroup.Where(r => r.HasEta).ToList();
+                                
+                                if (routesWithEta.Any())
+                                {
+                                    // Update the original collection in the StopGroup
+                                    originalRoutesInGroup.Clear();
+                                    foreach (var routeToAdd in routesWithEta)
+                                    {
+                                        originalRoutesInGroup.Add(routeToAdd);
+                                    }
+                                    newActiveStopGroupsReadyForUi.Add(result.group);
+                                }
+                            }
                         }
                     }
 
@@ -4734,6 +4850,13 @@ public partial class MainPage : ContentPage
 			IsRefreshing = false; // Ensure IsRefreshing is false after adaptation finishes
 			_logger?.LogInformation("Finished adapting display to filter {newFilter}. Routes count: {count}", newFilter, this.Routes.Count);
 		}
+	}
+
+	// This is a void version that doesn't return a value
+	private async Task ApplyEtasToStopGroupVoidAsync(StopGroup stopGroup, List<TransportEta> allEtas)
+	{
+		// Just delegate to the main implementation and ignore the return value
+		await ApplyEtasToStopGroupAsync(stopGroup, allEtas);
 	}
 }
 

@@ -687,6 +687,36 @@ namespace hk_realtime_transport_info_maui.Services
             ));
         }
         
+        /// <summary>
+        /// Gets a route by its ID asynchronously
+        /// </summary>
+        /// <param name="routeId">The ID of the route to retrieve</param>
+        /// <returns>The route if found, null otherwise</returns>
+        public Task<TransportRoute?> GetRouteByIdAsync(string routeId)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(routeId))
+                    {
+                        _logger?.LogWarning("GetRouteByIdAsync called with null or empty routeId");
+                        return null;
+                    }
+                    
+                    var db = GetDatabase();
+                    var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
+                    
+                    return routeCollection.FindById(routeId);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error getting route by ID {routeId}", routeId);
+                    return null;
+                }
+            });
+        }
+        
         public int CountRouteDirections(string routeNumber, string serviceType, TransportOperator transportOperator)
         {
             var db = GetDatabase();
