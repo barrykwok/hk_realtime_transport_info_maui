@@ -38,7 +38,6 @@ namespace hk_realtime_transport_info_maui.Services
         // Rate limiting
         private readonly SemaphoreSlim _rateLimiter = new SemaphoreSlim(1, 1);
         private DateTime _lastRequestTime = DateTime.MinValue;
-        private const int MIN_DELAY_BETWEEN_REQUESTS_MS = 100; // 10 requests per second max
 
         // Default settings
         private readonly int _maxConcurrentRequests;
@@ -371,28 +370,18 @@ namespace hk_realtime_transport_info_maui.Services
         
         private async Task ApplyRateLimitingAsync(bool isHighPriority)
         {
+            // Simple synchronization without fixed delays
             try
             {
                 await _rateLimiter.WaitAsync();
-                
-                var elapsed = DateTime.UtcNow - _lastRequestTime;
-                var minDelay = isHighPriority 
-                    ? TimeSpan.FromMilliseconds(MIN_DELAY_BETWEEN_REQUESTS_MS / 2)  // Half delay for high priority
-                    : TimeSpan.FromMilliseconds(MIN_DELAY_BETWEEN_REQUESTS_MS);
-                
-                if (elapsed < minDelay)
-                {
-                    var delayTime = minDelay - elapsed;
-                    await Task.Delay(delayTime); // Actually delay to prevent API rate limiting
-                    _logger?.LogDebug("Rate limiting applied: delayed request by {delayMs}ms", delayTime.TotalMilliseconds);
-                }
-                
+                // No artificial delay - just update the last request time
                 _lastRequestTime = DateTime.UtcNow;
             }
             finally
             {
                 _rateLimiter.Release();
             }
+            // The retry logic in ExecuteWithRetryAsync will handle any rate limiting responses from the server
         }
 
         /// <summary>
@@ -631,7 +620,7 @@ namespace hk_realtime_transport_info_maui.Services
                    statusCode == HttpStatusCode.ServiceUnavailable ||
                    statusCode == HttpStatusCode.GatewayTimeout ||
                    statusCode == HttpStatusCode.Forbidden ||
-                   statusCode == HttpStatusCode.TooManyRequests;
+                   statusCode == HttpStatusCode.TooManyRequests; // Rate limiting (429)
         }
 
         /// <summary>
@@ -709,7 +698,7 @@ namespace hk_realtime_transport_info_maui.Services
                 }
             }
             
-            // Use semaphore to limit concurrent requests
+            // Use semaphore to limit concurrent requests but don't add artificial delay
             await _rateLimiter.WaitAsync();
             
             try
@@ -728,6 +717,22 @@ namespace hk_realtime_transport_info_maui.Services
                         
                         // Make the request
                         var response = await _httpClient.GetAsync(url, cts.Token);
+                        
+                        // Check if we got a rate limit response (429)
+                        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                        {
+                            if (retryCount < _maxRetryAttempts)
+                            {
+                                retryCount++;
+                                _logger?.LogWarning("Rate limited (429) on attempt {attemptNumber}, retrying after {delay}ms: {url}", 
+                                    retryCount, delay, url);
+                                
+                                // Wait before retrying with exponential backoff
+                                await Task.Delay(delay);
+                                delay = Math.Min(delay * 2, _maxRetryDelayMs);
+                                continue;
+                            }
+                        }
                         
                         // Check status
                         response.EnsureSuccessStatusCode();
@@ -890,7 +895,7 @@ namespace hk_realtime_transport_info_maui.Services
     /// </summary>
     public class HttpClientUtilityOptions
     {
-        public int MaxConcurrentRequests { get; set; } = 6;
+        public int MaxConcurrentRequests { get; set; } = 10;
         public int MaxRetryAttempts { get; set; } = 3;
         public int InitialRetryDelayMs { get; set; } = 1000;
         public int MaxRetryDelayMs { get; set; } = 15000;
