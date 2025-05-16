@@ -3390,7 +3390,7 @@ public partial class MainPage : ContentPage
 	}
 
 	// New method to fetch and apply ETAs for a specific stop group
-	private async Task FetchAndApplyEtasForStopGroup(StopGroup stopGroup)
+	private async Task<bool> FetchAndApplyEtasForStopGroup(StopGroup stopGroup)
 	{
 		try
 		{
@@ -3402,8 +3402,7 @@ public partial class MainPage : ContentPage
 			{
 				_logger?.LogDebug("Using cached ETAs for stop: {stopId}", stopGroup.Stop.StopId);
 				var cachedEtas = await _etaService.GetCachedEtas(stopGroup.Stop.StopId);
-				await ApplyEtasToStopGroupVoidAsync(stopGroup, cachedEtas);
-				return;
+				return await ApplyEtasToStopGroupAsync(stopGroup, cachedEtas);
 			}
 				
 			// Get ETAs for this stop - check if it's an MTR stop or KMB stop
@@ -3426,7 +3425,7 @@ public partial class MainPage : ContentPage
 				    stopGroup.Stop.StopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase) ? 
 				        stopGroup.Stop.StopId.Substring(4) : stopGroup.Stop.StopId, 
 				    stopGroup.Stop.StopId);
-				return;
+				return false;
 			}
 			
 			_logger?.LogInformation("Found {count} ETAs for stop: {stopId}, full ID: {fullId}", 
@@ -3472,11 +3471,15 @@ public partial class MainPage : ContentPage
 			}
 			
 			// Apply the filtered ETAs to the stop group
-			await ApplyEtasToStopGroupVoidAsync(stopGroup, filteredEtas);
+			bool result = await ApplyEtasToStopGroupAsync(stopGroup, filteredEtas);
+			
+			// Return true if any routes in the stop group now have ETAs
+			return stopGroup.Routes.Any(r => r.HasEta);
 		}
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Error fetching ETAs for stop {stopName}", stopGroup.Stop.LocalizedName);
+			return false;
 		}
 	}
 
@@ -3506,14 +3509,19 @@ public partial class MainPage : ContentPage
 				{
 					_logger?.LogDebug("No stop groups passed to UpdateEtasForCurrentView to update ETAs for.");
 					lock (_etaLock) { _isUpdatingEtas = false; } 
+					// DON'T replace the Routes collection when there are no stop groups
+					// Just ensure the collection is properly initialized if needed
 					await MainThread.InvokeOnMainThreadAsync(() => 
 					{
-						this.Routes = new ObservableRangeCollection<object>();
-						var collectionView = this.FindByName<CollectionView>("RoutesCollection");
-						if (collectionView != null) 
+						if (this.Routes == null)
 						{
-							collectionView.ItemsSource = null;
-							collectionView.ItemsSource = this.Routes;
+							this.Routes = new ObservableRangeCollection<object>();
+							var collectionView = this.FindByName<CollectionView>("RoutesCollection");
+							if (collectionView != null) 
+							{
+								collectionView.ItemsSource = null;
+								collectionView.ItemsSource = this.Routes;
+							}
 						}
 					});
 					return;
@@ -3531,116 +3539,114 @@ public partial class MainPage : ContentPage
 					
 					foreach (var stopId in batchStopIds)
 					{
-						batchTasks.Add(Task.Run(async () => 
+						// Get all stop groups with this stop ID
+						var stopGroupsWithId = originalStopGroups.Where(sg => sg.Stop.Id == stopId).ToList();
+						
+						if (stopGroupsWithId.Count == 0)
+						{
+							continue;
+						}
+						
+						// Group stops by stop ID to avoid redundant calls
+						var firstStopGroup = stopGroupsWithId.FirstOrDefault();
+						if (firstStopGroup == null)
+						{
+							_logger?.LogWarning("No stop group found for stop ID: {stopId}", stopId);
+							continue;
+						}
+						
+						var task = Task.Run(async () =>
 						{
 							try
 							{
-								// Check if it's an MTR stop or KMB stop
-								List<TransportEta> etas;
+								bool anySuccessfulEta = await FetchAndApplyEtasForStopGroup(firstStopGroup);
 								
-								if (stopId.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase))
+								// Update the activity status for this stop
+								lock (groupActivityStatus)
 								{
-									_logger?.LogDebug("Fetching MTR ETAs for stop: {stopId} in batch", stopId);
-									etas = await _etaService.FetchAllMtrEtaForStop(stopId);
-								}
-								else
-								{
-									_logger?.LogDebug("Fetching KMB ETAs for stop: {stopId} in batch", stopId);
-									etas = await _etaService.FetchAllKmbEtaForStopOptimized(stopId);
+									groupActivityStatus[stopId] = anySuccessfulEta;
 								}
 								
-								var relatedOriginalGroups = originalStopGroups.Where(sg => sg.Stop.Id == stopId).ToList();
-								
-								foreach (var group in relatedOriginalGroups)
+								// Update other stop groups with the same ID if this is successful
+								if (anySuccessfulEta && stopGroupsWithId.Count > 1)
 								{
-									// The Task<bool> version is fine here since we need the return value
-									bool isActive = await ApplyEtasToStopGroupAsync(group, etas);
-									groupActivityStatus[group.Stop.Id] = groupActivityStatus.ContainsKey(group.Stop.Id) ? groupActivityStatus[group.Stop.Id] || isActive : isActive;
+									var secondaryStopGroups = stopGroupsWithId.Skip(1).ToList();
+									foreach (var secondaryGroup in secondaryStopGroups)
+									{
+										// Share ETAs across all stop groups with same stop ID to reduce API calls
+										await MainThread.InvokeOnMainThreadAsync(() => {
+											if (secondaryGroup.Routes != null)
+											{
+												foreach (var route in secondaryGroup.Routes)
+												{
+													// Find matching route in first stop group
+													var sourceRoute = firstStopGroup.Routes.FirstOrDefault(r => 
+														r.RouteNumber == route.RouteNumber && 
+														r.Operator == route.Operator &&
+														r.ServiceType == route.ServiceType);
+													
+													if (sourceRoute != null && sourceRoute.HasEta)
+													{
+														route.FirstEta = sourceRoute.FirstEta;
+														route.NextEta = sourceRoute.NextEta;
+														route.Etas = sourceRoute.Etas.ToList(); // Clone to avoid reference issues
+													}
+												}
+											}
+										});
+									}
 								}
 							}
 							catch (Exception ex)
 							{
-								_logger?.LogError(ex, "Error fetching/applying ETAs for stop {stopId} in batch.", stopId);
-								// If error, mark related groups as inactive for safety
-								var erroredGroups = originalStopGroups.Where(sg => sg.Stop.Id == stopId);
-								foreach(var eg in erroredGroups) groupActivityStatus[eg.Stop.Id] = false;
+								_logger?.LogError(ex, "Error updating ETAs for stop ID: {stopId}", stopId);
 							}
-						}));
+						});
+						
+						batchTasks.Add(task);
 					}
 					
-					await Task.WhenAll(batchTasks);
-					
-					if (i + batchSize < stopIds.Count)
+					// Wait for all tasks in this batch to complete before moving to next batch
+					if (batchTasks.Count > 0)
 					{
-						await Task.Delay(50); // Shorter delay between batches
+						await Task.WhenAll(batchTasks);
 					}
+					
+					// Small delay between batches to avoid UI freezing
+					await Task.Delay(100);
 				}
 				
-				var finalStopGroupsToDisplay = new List<StopGroup>();
-				foreach(var originalGroup in originalStopGroups)
+				// Check if we need to clean up any stop groups without ETAs
+				if (_currentDistanceFilter != DistanceFilter.All)
 				{
-					bool isActive = groupActivityStatus.TryGetValue(originalGroup.Stop.Id, out var status) && status;
-					if (isActive)
-					{
-						var routesWithEta = originalGroup.Routes.Where(r => r.HasEta).ToList();
-						if (routesWithEta.Any())
-						{
-							var newUiStopGroup = new StopGroup(originalGroup.Stop, new ObservableRangeCollection<TransportRoute>(routesWithEta), originalGroup.DistanceInMeters);
-							finalStopGroupsToDisplay.Add(newUiStopGroup);
-						}
-					}
+					await CleanupEmptyStopGroupsFromViewAsync();
 				}
-
-				_logger?.LogInformation("UpdateEtasForCurrentView: After ETA processing, {count} final stop groups constructed with active routes.", finalStopGroupsToDisplay.Count);
-
-				await MainThread.InvokeOnMainThreadAsync(() =>
-				{
-					var newCollection = new ObservableRangeCollection<object>();
-					newCollection.AddRange(finalStopGroupsToDisplay.Cast<object>().OrderBy(sg => ((StopGroup)sg).DistanceInMeters)); // Sort by distance again
-					
-					this.Routes = newCollection;
-
-					var collectionView = this.FindByName<CollectionView>("RoutesCollection");
-					if (collectionView != null)
-					{
-						_logger?.LogInformation("[Main Update] Explicitly setting ItemsSource on RoutesCollection with {count} final items.", newCollection.Count);
-						collectionView.ItemsSource = null;
-						collectionView.ItemsSource = this.Routes;
-					}
-					
-					var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
-					if (noRoutesLabel != null)
-					{
-						if (finalStopGroupsToDisplay.Count == 0 && _currentDistanceFilter != DistanceFilter.All)
-						{
-							noRoutesLabel.Text = $"No active routes found within {_currentDistanceFilter.ToString().Replace("Meters", "")}m of your location.";
-							noRoutesLabel.IsVisible = true;
-						}
-						else
-						{
-							noRoutesLabel.IsVisible = finalStopGroupsToDisplay.Count == 0; 
-						}
-					}
+				
+				// IMPORTANT: Do NOT replace the entire collection with a new one 
+				// as that causes scrolling to reset and UI flickering
+				
+				// Instead, ensure the UI is updated in-place
+				await MainThread.InvokeOnMainThreadAsync(() => {
+					// Just notify that the collection may have changed
+					OnPropertyChanged(nameof(Routes));
 				});
-
-				_logger?.LogInformation("Completed UpdateEtasForCurrentView. Final UI update scheduled with {count} items.", finalStopGroupsToDisplay.Count);
-				EnsureEtaTimerIsRunning();
+			}
+			catch (Exception ex)
+			{
+				_logger?.LogError(ex, "Error updating ETAs for current view");
 			}
 			finally
 			{
 				lock (_etaLock)
 				{
-					_isUpdatingEtas = false; 
+					_isUpdatingEtas = false;
 				}
 			}
 		}
 		catch (Exception ex)
 		{
-			_logger?.LogError(ex, "Outer error in UpdateEtasForCurrentView");
-			lock (_etaLock)
-			{
-				_isUpdatingEtas = false; 
-			}
+			_logger?.LogError(ex, "Unexpected error in UpdateEtasForCurrentView");
+			lock (_etaLock) { _isUpdatingEtas = false; }
 		}
 	}
 
