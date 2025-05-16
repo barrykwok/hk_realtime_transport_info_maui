@@ -399,7 +399,7 @@
                                       HeightRequest="-1"
                                       RemainingItemsThreshold="5"
                                       RemainingItemsThresholdReached="OnRemainingItemsThresholdReached"
-                                      ItemsUpdatingScrollMode="KeepItemsInView"
+                                      ItemsUpdatingScrollMode="KeepScrollOffset"
                                       Scrolled="OnCollectionViewScrolled"
                                       Margin="5,5,5,0">
                             <CollectionView.EmptyView>

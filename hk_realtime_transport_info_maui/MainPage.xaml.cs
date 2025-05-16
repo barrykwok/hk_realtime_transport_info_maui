@@ -613,6 +613,23 @@ public partial class MainPage : ContentPage
 		{
 			if (_filteredRoutes != value)
 			{
+				// Detect if this is a call from UpdateEtasForCurrentView or UpdateExpandedStopGroupEtas
+				bool isEtaUpdate = new StackTrace().ToString().Contains("UpdateEtas");
+				
+				// Check if the collection is the same instance but different content
+				bool sameInstance = ReferenceEquals(_filteredRoutes, value);
+				
+				// During ETA updates, we prefer modifying the existing collection in-place
+				// instead of replacing it to avoid scroll position reset
+				if (isEtaUpdate && !sameInstance && _filteredRoutes != null && _filteredRoutes.Count > 0)
+				{
+					_logger?.LogDebug("Routes setter: ETA update detected, preserving existing collection to maintain scroll position");
+					
+					// Just notify that the content changed but don't replace the collection
+					OnPropertyChanged(nameof(Routes));
+					return;
+				}
+				
 				_filteredRoutes = value;
 				OnPropertyChanged(nameof(Routes));
 				
@@ -781,6 +798,12 @@ public partial class MainPage : ContentPage
 	
 	// Timer for ETA display text updates (updates display without fetching new ETAs)
 	private IDispatcherTimer? _etaDisplayUpdateTimer;
+
+	// Add these fields after _currentBatchIndex
+	private int _lastScrolledItemIndex = 0;
+	private int _lastScrolledItemOffset = 0;
+	private bool _isRestoringScrollPosition = false;
+	private bool _shouldRestoreScrollPosition = false;
 
 	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, MtrDataService mtrDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
@@ -1690,6 +1713,13 @@ public partial class MainPage : ContentPage
 	// Handle collection view scrolling
 	private void OnCollectionViewScrolled(object? sender, ItemsViewScrolledEventArgs e)
 	{
+		// Store current scroll position unless we're in the middle of restoring it
+		if (!_isRestoringScrollPosition && e.FirstVisibleItemIndex >= 0)
+		{
+			_lastScrolledItemIndex = e.FirstVisibleItemIndex;
+			_lastScrolledItemOffset = e.CenterItemIndex;
+		}
+
 		// Hide keyboard when scrolling
 		if (KeyboardManager.IsKeyboardVisible)
 		{
@@ -1880,7 +1910,17 @@ public partial class MainPage : ContentPage
 
 		try
 		{
-			IsRefreshing = true;
+			// Save scroll position before updating nearby stops
+			SaveScrollPosition();
+			
+			// Only show refresh indicator if the list is empty
+			bool hasExistingItems = Routes != null && Routes.Count > 0;
+			
+			if (!hasExistingItems)
+			{
+				await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = true);
+			}
+			
 			_logger.LogInformation("UpdateNearbyStops: Current user location is Lat={Lat}, Lng={Lng}", _userLocation.Latitude, _userLocation.Longitude);
 			
 			var userFullGeohash = NGeoHash.GeoHash.Encode(_userLocation.Latitude, _userLocation.Longitude, 8); 
@@ -1896,7 +1936,8 @@ public partial class MainPage : ContentPage
 			if (!nearbyStops.Any())
 			{
 				_logger.LogWarning("UpdateNearbyStops: No stops found in database for the current location.");
-				IsRefreshing = false;
+				// Clear refresh indicator
+				await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
 				return;
 			}
 
@@ -1972,11 +2013,15 @@ public partial class MainPage : ContentPage
                     });
                 }
 			}
+			
+			// Always clear the refresh indicator when done
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
 		}
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Error updating nearby stops");
-			IsRefreshing = false;
+			// Make sure to clear the refresh indicator in case of error
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
 		}
 	}
 
@@ -2638,7 +2683,8 @@ public partial class MainPage : ContentPage
 					int randomDelay = new Random().Next(100, 1000);
 					await Task.Delay(randomDelay);
 					
-					// Schedule the actual update
+					// IMPORTANT: Always use the version without refresh indicator for timer-based background updates
+					// This is a background update that should never affect the UI's scroll position
 					await UpdateExpandedStopGroupEtas();
 				}
 				catch (Exception ex)
@@ -2665,12 +2711,18 @@ public partial class MainPage : ContentPage
 				return;
 			}
 			
+			// Save scroll position before updating ETAs
+			SaveScrollPosition();
+			
 			// Use a lock to ensure only one update runs at a time
 			lock (_etaLock)
 			{
 				if (_isUpdatingEtas) return;
 				_isUpdatingEtas = true;
 			}
+			
+			// IMPORTANT: NEVER show refresh indicator for background updates
+			// We'll never set IsRefreshing = true in this method
 			
 			try
 			{
@@ -2765,7 +2817,7 @@ public partial class MainPage : ContentPage
 								{
 									foreach (var stopGroup in relatedStopGroups)
 									{
-										await ApplyEtasToStopGroupAsync(stopGroup, allEtas);
+										await ApplyEtasToStopGroupVoidAsync(stopGroup, allEtas);
 									}
 								}
 							}
@@ -2791,8 +2843,15 @@ public partial class MainPage : ContentPage
 				}
 				
 				_logger?.LogInformation("Completed ETA updates for all expanded stop groups");
+				
+				// IMPORTANT: Don't call OnPropertyChanged(nameof(Routes)) here as it resets scroll position
+				// Instead, individual item property changes will propagate through data binding
+				
 				// Call cleanup after processing all ETAs for expanded groups
-				await CleanupEmptyStopGroupsFromViewAsync(); 
+				await CleanupEmptyStopGroupsFromViewAsync();
+				
+				// Restore scroll position after updates
+				await RestoreScrollPosition();
 			}
 			finally
 			{
@@ -3500,6 +3559,15 @@ public partial class MainPage : ContentPage
 				_isUpdatingEtas = true;
 			}
 			
+			// Store initial state of routes count - if we have items, don't show progress indicator
+			bool hasExistingRoutes = Routes != null && Routes.Count > 0;
+			
+			// Only show refresh indicator if we don't have any routes
+			if (!hasExistingRoutes)
+			{
+				await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = true);
+			}
+			
 			List<StopGroup> originalStopGroups = stopGroupsToProcessFromCaller.OfType<StopGroup>().ToList();
 			Dictionary<string, bool> groupActivityStatus = new Dictionary<string, bool>(); // StopId to isActive
 
@@ -3513,6 +3581,12 @@ public partial class MainPage : ContentPage
 					// Just ensure the collection is properly initialized if needed
 					await MainThread.InvokeOnMainThreadAsync(() => 
 					{
+						// Clear refresh indicator if we set it earlier
+						if (!hasExistingRoutes)
+						{
+							IsRefreshing = false;
+						}
+						
 						if (this.Routes == null)
 						{
 							this.Routes = new ObservableRangeCollection<object>();
@@ -3627,6 +3701,12 @@ public partial class MainPage : ContentPage
 				
 				// Instead, ensure the UI is updated in-place
 				await MainThread.InvokeOnMainThreadAsync(() => {
+					// Clear refresh indicator if we set it earlier
+					if (!hasExistingRoutes)
+					{
+						IsRefreshing = false;
+					}
+					
 					// Just notify that the collection may have changed
 					OnPropertyChanged(nameof(Routes));
 				});
@@ -3637,6 +3717,12 @@ public partial class MainPage : ContentPage
 			}
 			finally
 			{
+				// Make sure to clear the refresh indicator if we set it
+				if (!hasExistingRoutes)
+				{
+					await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
+				}
+				
 				lock (_etaLock)
 				{
 					_isUpdatingEtas = false;
@@ -3646,6 +3732,10 @@ public partial class MainPage : ContentPage
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Unexpected error in UpdateEtasForCurrentView");
+			
+			// Clear refresh indicator in case of error
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
+			
 			lock (_etaLock) { _isUpdatingEtas = false; }
 		}
 	}
@@ -3658,41 +3748,27 @@ public partial class MainPage : ContentPage
 			if (Routes is ObservableRangeCollection<object> currentRoutesCollection)
 			{
 				_logger?.LogInformation("[MainThread Cleanup] Inspecting StopGroups before removal. Total items in Routes: {TotalCount}", currentRoutesCollection.Count);
-				foreach (var item in currentRoutesCollection)
-				{
-					if (item is StopGroup sg_inspect)
-					{
-						_logger?.LogInformation($"[MainThread Cleanup Inspect] StopGroup ID: {sg_inspect.Stop.StopId}, Name: {sg_inspect.Stop.LocalizedName}, Routes.Count: {sg_inspect.Routes.Count}, HasAnyVisibleRoutesWithEta: {sg_inspect.HasAnyVisibleRoutesWithEta}");
-					}
-				}
-
+				
 				var groupsToRemove = currentRoutesCollection.OfType<StopGroup>()
 												.Where(sg => !sg.HasAnyVisibleRoutesWithEta) // Use the property as intended
 												.ToList();
 				
 				if (groupsToRemove.Any())
 				{
-					_logger?.LogInformation("[MainThread Cleanup] Rebuilding Routes collection to remove {count} StopGroups with no active routes based on HasAnyVisibleRoutesWithEta.", groupsToRemove.Count);
-					var itemsToKeep = currentRoutesCollection.Where(item =>
-						!(item is StopGroup sg && groupsToRemove.Contains(sg))
-					).ToList();
+					_logger?.LogInformation("[MainThread Cleanup] Removing {count} empty StopGroups with no active routes.", groupsToRemove.Count);
 					
-					// Create a new collection with items to keep and assign it
-					var newCollection = new ObservableRangeCollection<object>();
-					newCollection.AddRange(itemsToKeep); // Efficiently add items
-					
-					// DIAGNOSTIC: Temporarily comment out the line that clears the list to see if HasAnyVisibleRoutesWithEta is the issue
-					// Routes = newCollection; // Assign to the property to trigger setter and UI update
-					_logger?.LogWarning("[MainThread Cleanup DIAGNOSTIC] Routes collection was NOT updated/cleared. Would have set to {count} items.", newCollection.Count);
-
-					// Explicitly update the CollectionView's ItemsSource
-					var collectionView = this.FindByName<CollectionView>("RoutesCollection");
-					if (collectionView != null)
-					{
-						_logger?.LogInformation("[MainThread Cleanup] Explicitly setting ItemsSource on RoutesCollection after removing empty groups.");
-						collectionView.ItemsSource = null; 
-						collectionView.ItemsSource = Routes; // Set it to the new collection instance
+					// Use batch operations to avoid UI flickering and maintain scroll position
+					currentRoutesCollection.BeginBatch();
+					try {
+						// Remove the groups with no active routes
+						currentRoutesCollection.RemoveRange(groupsToRemove);
 					}
+					finally {
+						// End batch mode to apply changes at once, this preserves scroll position better
+						currentRoutesCollection.EndBatch();
+					}
+					
+					// IMPORTANT: Don't call OnPropertyChanged(nameof(Routes)) as it resets scroll position
 				}
 				else
 				{
@@ -4666,6 +4742,15 @@ public partial class MainPage : ContentPage
 		await _adaptLock.WaitAsync();
 		try
 		{
+			// Check if we have existing routes to decide whether to show refresh indicator
+			bool hasExistingItems = Routes != null && Routes.Count > 0;
+			
+			// Only show refresh indicator for empty lists to prevent shifting/flickering
+			if (!hasExistingItems)
+			{
+				await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = true);
+			}
+			
 			_logger?.LogInformation("Adapting display from current UI state to filter {newFilter}. Previous filter value was: {prevFilterValue}", newFilter, _previousDistanceFilterForIncrementalUpdate);
 
 			if (newFilter == DistanceFilter.All)
@@ -4837,11 +4922,81 @@ public partial class MainPage : ContentPage
 
 			await MainThread.InvokeOnMainThreadAsync(() =>
 			{
-				var newCollection = new ObservableRangeCollection<object>();
-				newCollection.AddRange(finalStopGroupsForUi);
-				this.Routes = newCollection; // This setter logs the count
-				// Update a flag or a separate property if CollectionView.ItemsSource needs direct update
-				// For now, assuming 'this.Routes' setter handles CollectionView update or binding does.
+				// Get the current collection
+				var currentCollection = this.Routes;
+
+				// We want to preserve the same collection instance to maintain scroll position
+				if (currentCollection is ObservableRangeCollection<object> observableCollection)
+				{
+					// Get current state of items
+					var currentStopGroups = observableCollection.OfType<StopGroup>().ToList();
+					var nonStopGroupItems = observableCollection.Where(item => !(item is StopGroup)).ToList();
+					
+					// Special case: If we're keeping all current items and just adding new ones, use AddRange to avoid scroll reset
+					var currentIds = currentStopGroups.Select(sg => sg.Stop.Id).ToHashSet();
+					var finalIds = finalStopGroupsForUi.Select(sg => sg.Stop.Id).ToHashSet();
+					
+					bool isAddingOnly = finalIds.IsSupersetOf(currentIds) && finalIds.Count > currentIds.Count;
+					bool isRemovingOnly = currentIds.IsSupersetOf(finalIds) && currentIds.Count > finalIds.Count;
+					bool isUnchanged = currentIds.SetEquals(finalIds) && currentIds.Count == finalIds.Count;
+					bool needsReordering = finalStopGroupsForUi.Count > 0 && 
+						!finalStopGroupsForUi.Select(sg => sg.Stop.Id)
+						.SequenceEqual(currentStopGroups.Select(sg => sg.Stop.Id));
+						
+					// IMPORTANT: Use batch operations to minimize UI updates and preserve scroll position
+					observableCollection.BeginBatch();
+					
+					try
+					{
+						if (isUnchanged && !needsReordering)
+						{
+							// Nothing to do if the collection is unchanged and in the same order
+							_logger?.LogDebug("Adapt: No changes to collection needed");
+						}
+						else if (isAddingOnly && !needsReordering)
+						{
+							// Just add the new items to the end
+							var newStopGroups = finalStopGroupsForUi.Where(sg => !currentIds.Contains(sg.Stop.Id)).ToList();
+							_logger?.LogDebug("Adapt: Adding {count} new stop groups", newStopGroups.Count);
+							observableCollection.AddRange(newStopGroups);
+						}
+						else if (isRemovingOnly && !needsReordering)
+						{
+							// Just remove items no longer needed
+							var stopGroupsToRemove = currentStopGroups.Where(sg => !finalIds.Contains(sg.Stop.Id)).ToList();
+							_logger?.LogDebug("Adapt: Removing {count} stop groups", stopGroupsToRemove.Count);
+							observableCollection.RemoveRange(stopGroupsToRemove);
+						}
+						else
+						{
+							// More complex case - preserve any non-StopGroup items
+							observableCollection.Clear();
+							
+							// Add all items back in the correct order
+							if (nonStopGroupItems.Any())
+							{
+								observableCollection.AddRange(nonStopGroupItems);
+							}
+							
+							// Add the stop groups in their sorted order
+							observableCollection.AddRange(finalStopGroupsForUi);
+							_logger?.LogDebug("Adapt: Complete rebuild of collection with {count} stop groups", finalStopGroupsForUi.Count);
+						}
+					}
+					finally
+					{
+						// End batch to apply all changes at once
+						observableCollection.EndBatch();
+					}
+				}
+				else
+				{
+					// Fallback (should never happen)
+					var newCollection = new ObservableRangeCollection<object>();
+					newCollection.AddRange(finalStopGroupsForUi);
+					this.Routes = newCollection;
+					_logger?.LogWarning("Adapt: Had to create new collection - scroll position may reset");
+				}
 			});
 
 			_previousDistanceFilterForIncrementalUpdate = newFilter;
@@ -4853,16 +5008,126 @@ public partial class MainPage : ContentPage
 		finally
 		{
 			_adaptLock.Release();
-			IsRefreshing = false; // Ensure IsRefreshing is false after adaptation finishes
+			// Clear the refresh indicator on the UI thread to ensure it's updated
+			await MainThread.InvokeOnMainThreadAsync(() => IsRefreshing = false);
 			_logger?.LogInformation("Finished adapting display to filter {newFilter}. Routes count: {count}", newFilter, this.Routes.Count);
 		}
 	}
 
-	// This is a void version that doesn't return a value
+	// This is a void version that doesn't return a value but modifies the stop group in-place
 	private async Task ApplyEtasToStopGroupVoidAsync(StopGroup stopGroup, List<TransportEta> allEtas)
 	{
-		// Just delegate to the main implementation and ignore the return value
-		await ApplyEtasToStopGroupAsync(stopGroup, allEtas);
+		try
+		{
+			// Save the expanded state to restore it after updates
+			bool wasExpanded = stopGroup.IsExpanded;
+			
+			// Only run UI updates on the main thread
+			await MainThread.InvokeOnMainThreadAsync(() => {
+				if (stopGroup.Routes != null && stopGroup.Routes.Count > 0)
+				{
+					// Keep track of how many routes have ETAs for the stop group's state
+					int routesWithEta = 0;
+					
+					// Match the ETAs to routes inside this stop group
+					foreach (var route in stopGroup.Routes)
+					{
+						// Find matching ETAs for this route
+						var routeEtas = allEtas.Where(eta => 
+							eta.RouteNumber == route.RouteNumber &&
+							// TransportEta doesn't have Operator, so rely on matching RouteNumber and ServiceType
+							(!string.IsNullOrEmpty(route.ServiceType) && !string.IsNullOrEmpty(eta.ServiceType) 
+								? route.ServiceType.Equals(eta.ServiceType, StringComparison.OrdinalIgnoreCase) 
+								: true))
+							.OrderBy(eta => eta.EtaTime)
+							.ToList();
+							
+						if (routeEtas.Count > 0)
+						{
+							// Update existing route ETAs in-place without recreating objects
+							route.Etas.Clear();
+							route.Etas.AddRange(routeEtas);
+							
+							// Set firstEta string and nextEta object - this will trigger HasEta property through notification
+							route.FirstEta = routeEtas[0].DisplayEta;
+							route.NextEta = routeEtas.Count > 1 ? routeEtas[1] : null;
+							
+							routesWithEta++;
+						}
+						else
+						{
+							route.Etas.Clear();
+							route.FirstEta = string.Empty; // This will update HasEta property through notification
+							route.NextEta = null;
+						}
+					}
+					
+					// Preserve expanded state regardless of ETA status to avoid UI jumping
+					// NEVER collapse stop groups that were previously expanded, as it causes UI jumps
+					// Respect the user's choice to keep groups expanded
+				}
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error applying ETAs to stop group");
+		}
+	}
+
+	// Add method to save scroll position before ETA updates
+	private void SaveScrollPosition()
+	{
+		if (Routes?.Count > 0)
+		{
+			_shouldRestoreScrollPosition = true;
+			_logger?.LogDebug("Saving scroll position: FirstVisibleItem={FirstVisible}, Offset={Offset}", 
+				_lastScrolledItemIndex, _lastScrolledItemOffset);
+		}
+		else
+		{
+			_shouldRestoreScrollPosition = false;
+		}
+	}
+
+	// Add method to restore scroll position after ETA updates
+	private async Task RestoreScrollPosition()
+	{
+		try
+		{
+			if (!_shouldRestoreScrollPosition || _lastScrolledItemIndex < 0 || RoutesCollection == null || Routes?.Count == 0)
+			{
+				return;
+			}
+
+			_isRestoringScrollPosition = true;
+			
+			try
+			{
+				await MainThread.InvokeOnMainThreadAsync(async () => {
+					// Ensure the index is valid
+					int itemIndex = Math.Min(_lastScrolledItemIndex, Routes.Count - 1);
+					if (itemIndex >= 0)
+					{
+						_logger?.LogDebug("Restoring scroll position to item {ItemIndex}", itemIndex);
+						RoutesCollection.ScrollTo(itemIndex, -1, ScrollToPosition.Start, false);
+						
+						// Small delay to allow the UI to update
+						await Task.Delay(50);
+					}
+				});
+			}
+			finally
+			{
+				_isRestoringScrollPosition = false;
+				_shouldRestoreScrollPosition = false;
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger?.LogError(ex, "Error restoring scroll position");
+			_isRestoringScrollPosition = false;
+			_shouldRestoreScrollPosition = false;
+		}
 	}
 }
 

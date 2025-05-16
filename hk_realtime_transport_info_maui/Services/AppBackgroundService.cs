@@ -19,6 +19,9 @@ namespace hk_realtime_transport_info_maui.Services
         // Interval for database optimization (once per day when app is idle)
         private readonly TimeSpan _optimizationInterval = TimeSpan.FromDays(1);
         
+        // Flag to control whether database maintenance should run automatically
+        public bool EnableAutomaticMaintenance { get; set; } = false; // Disabled by default
+        
         public AppBackgroundService(LiteDbService databaseService, ILogger<AppBackgroundService> logger)
         {
             _databaseService = databaseService;
@@ -70,8 +73,16 @@ namespace hk_realtime_transport_info_maui.Services
                 {
                     try
                     {
-                        // Perform database optimization during idle time
-                        RunDatabaseOptimization();
+                        // Only run database optimization if explicitly enabled
+                        if (EnableAutomaticMaintenance)
+                        {
+                            // Perform database optimization during idle time
+                            RunDatabaseOptimization();
+                        }
+                        else
+                        {
+                            _logger?.LogDebug("Skipping database maintenance as it is disabled");
+                        }
                         
                         // Wait until next scheduled maintenance
                         await Task.Delay(_optimizationInterval, cancellationToken);

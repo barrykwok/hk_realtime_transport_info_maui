@@ -11,8 +11,7 @@ namespace hk_realtime_transport_info_maui.Models
     /// <typeparam name="T"></typeparam>
     public class ObservableRangeCollection<T> : ObservableCollection<T>
     {
-        private bool _suppressNotification = false;
-        private bool _isInBatchMode = false;
+        private bool _suppressNotification = false; // Flag to control notification suppression during batch operations
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ObservableRangeCollection{T}"/> class.
@@ -30,7 +29,6 @@ namespace hk_realtime_transport_info_maui.Models
         /// </summary>
         public void BeginBatch()
         {
-            _isInBatchMode = true;
             _suppressNotification = true;
         }
 
@@ -39,7 +37,6 @@ namespace hk_realtime_transport_info_maui.Models
         /// </summary>
         public void EndBatch()
         {
-            _isInBatchMode = false;
             _suppressNotification = false;
             
             // Raise a reset notification to update the UI once
