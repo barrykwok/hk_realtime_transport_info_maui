@@ -4832,6 +4832,17 @@ public partial class MainPage : ContentPage
 						{
 							routesForStop = routesForStop.Where(r => r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
 						}
+						// Deduplicate: Only keep ServiceType == "1" if multiple service types exist for the same route
+						routesForStop = routesForStop
+							.GroupBy(r => new { r.Operator, r.RouteNumber, r.Bound })
+							.Select(g =>
+							{
+								if (g.Count() == 1)
+									return g.First();
+								var primary = g.FirstOrDefault(r => r.ServiceType == "1");
+								return primary ?? g.First();
+							})
+							.ToList();
 						if (routesForStop.Any())
 						{
 							// Calculate distance in Kilometers then convert to meters for the StopGroup constructor
