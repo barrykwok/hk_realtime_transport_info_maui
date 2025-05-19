@@ -358,68 +358,28 @@ namespace hk_realtime_transport_info_maui.Services
                 _logger?.LogInformation("Received {count} ETAs for KMB route {routeNumber} service type {serviceType}", 
                     routeEtaResponse.Data.Count, routeNumber, serviceType);
                 
-                // Process the ETAs by stop
-                var etasByStop = routeEtaResponse.Data
-                    .GroupBy(eta => eta.StopId)
-                    .ToDictionary(g => g.Key ?? string.Empty, g => g.ToList());
+                // Check if ETAs have StopId populated
+                bool hasStopIds = routeEtaResponse.Data.Any(eta => !string.IsNullOrEmpty(eta.StopId));
                 
-                // Cache the current time for efficiency
-                DateTime now = DateTime.Now;
-                
-                // Process each group of ETAs for each stop
-                foreach (var stopGroup in etasByStop)
+                if (hasStopIds)
                 {
-                    string stopId = stopGroup.Key;
-                    var etaDataList = stopGroup.Value;
-                    
-                    if (string.IsNullOrEmpty(stopId) || etaDataList.Count == 0) continue;
-                    
-                    // Pre-size the list for performance
-                    var stopEtas = new List<TransportEta>(etaDataList.Count);
-                    
-                    foreach (var etaData in etaDataList)
-                    {
-                        if (string.IsNullOrEmpty(etaData.Eta)) continue;
+                    // Process the ETAs by stop ID
+                    var etasByStop = routeEtaResponse.Data
+                        .GroupBy(eta => eta.StopId)
+                        .ToDictionary(g => g.Key ?? string.Empty, g => g.ToList());
                         
-                        // Parse the ETA time
-                        if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
-                                CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
-                        {
-                            _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
-                            continue;
-                        }
+                    // Process each group of ETAs for each stop
+                    await ProcessEtasByStop(etasByStop, result, routeNumber, serviceType);
+                }
+                else
+                {
+                    // Process the ETAs by sequence number
+                    var etasBySeq = routeEtaResponse.Data
+                        .GroupBy(eta => eta.Seq)
+                        .ToDictionary(g => g.Key.ToString(), g => g.ToList());
                         
-                        // Generate a unique ID for this ETA
-                        string etaId = $"{etaData.Route}_{stopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
-                        
-                        // Calculate minutes remaining
-                        TimeSpan timeRemaining = etaTime - now;
-                        int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
-                        
-                        var eta = new TransportEta
-                        {
-                            Id = etaId,
-                            StopId = stopId,
-                            RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}",
-                            RouteNumber = etaData.Route ?? string.Empty,
-                            Direction = etaData.Dir ?? string.Empty,
-                            ServiceType = serviceType,
-                            FetchTime = now,
-                            Remarks = etaData.Remarks ?? string.Empty,
-                            EtaTime = etaTime,
-                            RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
-                            IsCancelled = !string.IsNullOrEmpty(etaData.Remarks) && 
-                                        etaData.Remarks?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true
-                        };
-                        
-                        stopEtas.Add(eta);
-                    }
-                    
-                    // Only add to the result if we have valid ETAs
-                    if (stopEtas.Count > 0)
-                    {
-                        result[stopId] = stopEtas;
-                    }
+                    // Process each group of ETAs by sequence
+                    await ProcessEtasBySequence(etasBySeq, result, routeNumber, serviceType);
                 }
                 
                 // Cache the result
@@ -434,6 +394,137 @@ namespace hk_realtime_transport_info_maui.Services
             }
             
             return result;
+        }
+
+        /// <summary>
+        /// Process ETAs grouped by stop ID
+        /// </summary>
+        private async Task ProcessEtasByStop(Dictionary<string, List<KmbEtaData>> etasByStop, 
+            Dictionary<string, List<TransportEta>> result, string routeNumber, string serviceType)
+        {
+            // Cache the current time for efficiency
+            DateTime now = DateTime.Now;
+            
+            foreach (var stopGroup in etasByStop)
+            {
+                string stopId = stopGroup.Key;
+                var etaDataList = stopGroup.Value;
+                
+                if (string.IsNullOrEmpty(stopId) || etaDataList.Count == 0) continue;
+                
+                // Pre-size the list for performance
+                var stopEtas = new List<TransportEta>(etaDataList.Count);
+                
+                foreach (var etaData in etaDataList)
+                {
+                    if (string.IsNullOrEmpty(etaData.Eta)) continue;
+                    
+                    // Parse the ETA time
+                    if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
+                            CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
+                    {
+                        _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
+                        continue;
+                    }
+                    
+                    // Generate a unique ID for this ETA
+                    string etaId = $"{etaData.Route}_{stopId}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
+                    
+                    // Calculate minutes remaining
+                    TimeSpan timeRemaining = etaTime - now;
+                    int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
+                    
+                    var eta = new TransportEta
+                    {
+                        Id = etaId,
+                        StopId = stopId,
+                        RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}",
+                        RouteNumber = etaData.Route ?? string.Empty,
+                        Direction = etaData.Dir ?? string.Empty,
+                        ServiceType = serviceType,
+                        FetchTime = now,
+                        Remarks = etaData.RmkEn ?? etaData.Remarks ?? string.Empty,
+                        EtaTime = etaTime,
+                        RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
+                        IsCancelled = !string.IsNullOrEmpty(etaData.RmkEn) && 
+                                    etaData.RmkEn?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true
+                    };
+                    
+                    stopEtas.Add(eta);
+                }
+                
+                // Only add to the result if we have valid ETAs
+                if (stopEtas.Count > 0)
+                {
+                    result[stopId] = stopEtas;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Process ETAs grouped by sequence number
+        /// </summary>
+        private async Task ProcessEtasBySequence(Dictionary<string, List<KmbEtaData>> etasBySeq, 
+            Dictionary<string, List<TransportEta>> result, string routeNumber, string serviceType)
+        {
+            // Cache the current time for efficiency
+            DateTime now = DateTime.Now;
+            
+            foreach (var seqGroup in etasBySeq)
+            {
+                string seqKey = seqGroup.Key;
+                var etaDataList = seqGroup.Value;
+                
+                if (string.IsNullOrEmpty(seqKey) || etaDataList.Count == 0) continue;
+                
+                // Pre-size the list for performance
+                var seqEtas = new List<TransportEta>(etaDataList.Count);
+                
+                foreach (var etaData in etaDataList)
+                {
+                    if (string.IsNullOrEmpty(etaData.Eta)) continue;
+                    
+                    // Parse the ETA time
+                    if (!DateTime.TryParseExact(etaData.Eta, "yyyy-MM-ddTHH:mm:ss+08:00", 
+                            CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime etaTime))
+                    {
+                        _logger?.LogWarning("Failed to parse ETA time: {etaTime}", etaData.Eta);
+                        continue;
+                    }
+                    
+                    // Generate a unique ID for this ETA
+                    string etaId = $"{etaData.Route}_{seqKey}_{etaData.EtaSeq}_{etaData.Dir}_{etaTime:yyyyMMddHHmmss}";
+                    
+                    // Calculate minutes remaining
+                    TimeSpan timeRemaining = etaTime - now;
+                    int minutes = (int)Math.Ceiling(timeRemaining.TotalMinutes);
+                    
+                    var eta = new TransportEta
+                    {
+                        Id = etaId,
+                        StopId = string.Empty, // This will be filled in by EnhanceEtaDataWithStopIds
+                        RouteId = $"KMB_{etaData.Route}_{serviceType}_{etaData.Dir}",
+                        RouteNumber = etaData.Route ?? string.Empty,
+                        Direction = etaData.Dir ?? string.Empty,
+                        ServiceType = serviceType,
+                        FetchTime = now,
+                        Remarks = etaData.RmkEn ?? etaData.Remarks ?? string.Empty,
+                        EtaTime = etaTime,
+                        RemainingMinutes = minutes <= 0 ? "0" : minutes.ToString(),
+                        IsCancelled = !string.IsNullOrEmpty(etaData.RmkEn) && 
+                                    etaData.RmkEn?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true,
+                        Sequence = etaData.Seq // Store the sequence number for later matching
+                    };
+                    
+                    seqEtas.Add(eta);
+                }
+                
+                // Only add to the result if we have valid ETAs
+                if (seqEtas.Count > 0)
+                {
+                    result[seqKey] = seqEtas;
+                }
+            }
         }
 
         /// <summary>

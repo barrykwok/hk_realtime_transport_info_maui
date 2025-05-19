@@ -29,6 +29,9 @@ namespace hk_realtime_transport_info_maui.Models
         
         public bool IsCancelled { get; set; } = false;
         
+        // Sequence number of the stop in the route (for KMB route ETAs that only provide sequence)
+        public int Sequence { get; set; }
+        
         // Determines if the ETA is still valid (not older than 60 seconds)
         public bool IsValid
         {

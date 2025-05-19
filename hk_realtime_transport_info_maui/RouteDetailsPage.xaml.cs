@@ -1078,6 +1078,17 @@ public partial class RouteDetailsPage : ContentPage
         string routeDirection = Route.Bound;
         _logger?.LogDebug("Enhancing ETA data for route direction: {direction}", routeDirection);
         
+        // Create a lookup from sequence number to TransportStop
+        var stopsBySeq = new Dictionary<int, TransportStop>();
+        foreach (var stop in Stops)
+        {
+            if (stop.Sequence > 0)
+            {
+                stopsBySeq[stop.Sequence] = stop;
+            }
+        }
+        
+        // Step 1: Process ETAs that have StopId
         // For each stop, if we have ETAs for its StopId, add them using stop.Id as key too
         foreach (var stop in Stops)
         {
@@ -1103,6 +1114,49 @@ public partial class RouteDetailsPage : ContentPage
                     _logger?.LogDebug("Mapping {count} ETAs from StopId {stopId} to Id {id}", 
                         filteredEtas.Count, stop.StopId, stop.Id);
                     enhancedEtaData[stop.Id] = filteredEtas;
+                }
+            }
+        }
+        
+        // Step 2: Process ETAs that only have sequence number but no StopId
+        // Look for ETAs that are keyed by sequence number (as string) instead of stop ID
+        foreach (var etaEntry in etaData)
+        {
+            // If the key could be parsed as an integer, it might be a sequence number
+            if (int.TryParse(etaEntry.Key, out int seq) && stopsBySeq.TryGetValue(seq, out var stop))
+            {
+                var seqEtas = etaEntry.Value;
+                if (seqEtas != null && seqEtas.Count > 0)
+                {
+                    // Filter ETAs to only include those matching the current route direction
+                    var filteredSeqEtas = seqEtas.Where(eta => 
+                        eta != null && 
+                        (eta.Direction?.Equals(routeDirection, StringComparison.OrdinalIgnoreCase) ?? false)).ToList();
+                    
+                    // If we have no ETAs with matching direction, use a fallback
+                    if (filteredSeqEtas.Count == 0)
+                    {
+                        filteredSeqEtas = seqEtas.ToList();
+                    }
+                    
+                    if (filteredSeqEtas.Count > 0)
+                    {
+                        _logger?.LogDebug("Mapping {count} ETAs from sequence {seq} to stop ID {id}", 
+                            filteredSeqEtas.Count, seq, stop.Id);
+                        
+                        // Update the StopId in each ETA to the correct value
+                        foreach (var eta in filteredSeqEtas)
+                        {
+                            if (eta != null)
+                            {
+                                eta.StopId = stop.StopId;
+                            }
+                        }
+                        
+                        // Add by both stop.Id and stop.StopId to ensure we can find it in either case
+                        enhancedEtaData[stop.Id] = filteredSeqEtas;
+                        enhancedEtaData[stop.StopId] = filteredSeqEtas;
+                    }
                 }
             }
         }
