@@ -805,6 +805,9 @@ public partial class MainPage : ContentPage
 	private bool _isRestoringScrollPosition = false;
 	private bool _shouldRestoreScrollPosition = false;
 
+	// Add a private field to track the current loaded count for batching
+	private int _allRoutesLoadedCount = 0;
+
 	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, MtrDataService mtrDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
 	{
