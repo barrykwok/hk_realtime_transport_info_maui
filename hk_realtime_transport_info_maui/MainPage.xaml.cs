@@ -808,6 +808,8 @@ public partial class MainPage : ContentPage
 	// Add a private field to track the current loaded count for batching
 	private int _allRoutesLoadedCount = 0;
 
+	public ObservableCollection<TransportRoute> FavoriteRoutes { get; set; } = new();
+
 	public MainPage(LiteDbService databaseService, KmbDataService kmbDataService, MtrDataService mtrDataService, EtaService etaService, 
 		ILogger<MainPage> logger, LocationCacheService locationCacheService)
 	{
@@ -920,6 +922,7 @@ public partial class MainPage : ContentPage
 	protected override async void OnAppearing()
 	{
 		base.OnAppearing();
+		RefreshFavoritesGrid();
 		
 		// Show UI immediately instead of waiting for data
 		if (_allRoutes.Count == 0)
@@ -2952,34 +2955,17 @@ public partial class MainPage : ContentPage
 
 	// Handler for the Favorites section header
 	private bool _isFavoritesExpanded = true;
-	private void OnFavoriteHeaderTapped(object sender, TappedEventArgs e)
+	private async void OnFavoriteHeaderTapped(object sender, TappedEventArgs e)
 	{
 		try
 		{
-			// Toggle the expanded state
-			_isFavoritesExpanded = !_isFavoritesExpanded;
-			
-			// Find the favorite routes grid by name
-			Grid favoriteGrid = this.FindByName<Grid>("FavoriteRoutesGrid");
-			if (favoriteGrid != null && favoriteGrid.RowDefinitions.Count >= 2)
-			{
-				// If we found the grid, toggle visibility of the second row
-				// which contains the favorite routes list
-				if (favoriteGrid.Children.Count > 1)
-				{
-					var routesContent = favoriteGrid.Children[1] as Microsoft.Maui.Controls.VisualElement;
-					if (routesContent != null)
-					{
-						routesContent.IsVisible = _isFavoritesExpanded;
-					}
-				}
-				
-				_logger?.LogDebug("Toggled favorites expansion to {isExpanded}", _isFavoritesExpanded);
-			}
+			var loggerFactory = (_logger as ILoggerFactory) ?? new LoggerFactory();
+			var favoriteRoutesPage = new FavoriteRoutesPage(_databaseService, _etaService, loggerFactory);
+			await Navigation.PushAsync(favoriteRoutesPage);
 		}
 		catch (Exception ex)
 		{
-			_logger?.LogError(ex, "Error toggling favorites section");
+			_logger?.LogError(ex, "Error navigating to FavoriteRoutesPage");
 		}
 	}
 
@@ -5021,6 +5007,18 @@ public partial class MainPage : ContentPage
 			_isRestoringScrollPosition = false;
 			_shouldRestoreScrollPosition = false;
 		}
+	}
+
+	private void RefreshFavoritesGrid()
+	{
+		if (_databaseService == null)
+			return;
+		var favs = _databaseService.GetAllRecords<FavoriteRoute>("FavoriteRoutes").ToList();
+		var allRoutes = _databaseService.GetAllRecords<TransportRoute>("TransportRoutes").ToList();
+		var favRoutes = favs.Select(f => allRoutes.FirstOrDefault(r => r.Id == f.RouteId)).Where(r => r != null).ToList();
+		FavoriteRoutes.Clear();
+		foreach (var route in favRoutes)
+			FavoriteRoutes.Add(route);
 	}
 }
 

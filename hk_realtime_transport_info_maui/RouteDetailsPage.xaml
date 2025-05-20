@@ -25,6 +25,15 @@
                                  Size="20" />
             </ToolbarItem.IconImageSource>
         </ToolbarItem>
+        <ToolbarItem x:Name="FavoriteRouteButton"
+                     Order="Primary"
+                     Priority="0"
+                     IconImageSource="{Binding FavoriteIconGlyph}"
+                     Command="{Binding FavoriteCommand}">
+            <ToolbarItem.IconImageSource>
+                <FontImageSource FontFamily="{Binding FavoriteIconFontFamily}" Glyph="{Binding FavoriteIconGlyph}" Color="#FFD700" Size="20" />
+            </ToolbarItem.IconImageSource>
+        </ToolbarItem>
     </ContentPage.ToolbarItems>
 
     <Grid RowDefinitions="Auto,Auto,*" Padding="10">

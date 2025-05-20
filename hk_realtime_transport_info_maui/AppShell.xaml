@@ -22,4 +22,12 @@
         </Grid>
     </Shell.FlyoutFooter>
 
+    <FlyoutItem Title="Home" Icon="home" Route="MainPage">
+        <ShellContent ContentTemplate="{DataTemplate local:MainPage}" Route="MainPage" />
+    </FlyoutItem>
+
+    <FlyoutItem Title="Favorite Routes" Icon="star" Route="FavoriteRoutesPage">
+        <ShellContent ContentTemplate="{DataTemplate local:FavoriteRoutesPage}" Route="FavoriteRoutesPage" />
+    </FlyoutItem>
+
 </Shell>

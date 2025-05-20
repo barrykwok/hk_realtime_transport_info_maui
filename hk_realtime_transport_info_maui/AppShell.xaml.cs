@@ -37,14 +37,7 @@ public partial class AppShell : Shell
 		// Register routes
 		Routing.RegisterRoute(nameof(MainPage), typeof(MainPage));
 		Routing.RegisterRoute(nameof(RouteDetailsPage), typeof(RouteDetailsPage));
-		
-		// Set the main page
-		CurrentItem = new ShellContent
-		{
-			Content = _mainPage,
-			Route = nameof(MainPage),
-			Title = "Home"
-		};
+		Routing.RegisterRoute(nameof(FavoriteRoutesPage), typeof(FavoriteRoutesPage));
 	}
 	
 	// Language selection handlers

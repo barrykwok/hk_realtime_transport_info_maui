@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:local="clr-namespace:hk_realtime_transport_info_maui"
+             xmlns:models="clr-namespace:hk_realtime_transport_info_maui.Models"
+             x:Class="hk_realtime_transport_info_maui.FavoriteRoutesPage"
+             Title="Favorite Routes">
+    <ContentPage.Content>
+        <CollectionView x:Name="FavoritesCollection"
+                        ItemsSource="{Binding FavoriteRoutes}"
+                        SelectionMode="Single"
+                        SelectionChanged="OnFavoriteSelected"
+                        x:DataType="models:TransportRoute">
+            <CollectionView.ItemTemplate>
+                <DataTemplate x:DataType="models:TransportRoute">
+                    <Frame Margin="5" Padding="10" BorderColor="LightGray" CornerRadius="5" HasShadow="True">
+                        <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto">
+                            <Label Grid.Column="0"
+                                   Text="{Binding RouteNumber}"
+                                   FontSize="20"
+                                   FontAttributes="Bold"
+                                   TextColor="#3040F0"
+                                   VerticalOptions="Center" />
+                            <Label Grid.Column="1"
+                                   Text="{Binding GetDisplayName()}"
+                                   FontSize="16"
+                                   Margin="10,0,0,0"
+                                   VerticalOptions="Center" />
+                        </Grid>
+                    </Frame>
+                </DataTemplate>
+            </CollectionView.ItemTemplate>
+            <CollectionView.EmptyView>
+                <Label Text="No favorite routes yet." FontSize="18" HorizontalTextAlignment="Center" VerticalOptions="CenterAndExpand" />
+            </CollectionView.EmptyView>
+        </CollectionView>
+    </ContentPage.Content>
+</ContentPage> 

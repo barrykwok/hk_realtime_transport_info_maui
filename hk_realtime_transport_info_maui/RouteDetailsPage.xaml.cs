@@ -36,7 +36,21 @@ public partial class RouteDetailsPage : ContentPage
     // Timer for ETA display text updates (without fetching new ETAs)
     private IDispatcherTimer? _etaDisplayUpdateTimer;
     private bool _isUpdatingEtaDisplay = false;
+    private string _favoriteIconGlyph = "\uf006"; // Star outline
+    private string _favoriteIconFontFamily = "FontAwesomeRegular";
+    public string FavoriteIconGlyph
+    {
+        get => _favoriteIconGlyph;
+        set { _favoriteIconGlyph = value; OnPropertyChanged(); }
+    }
+    public string FavoriteIconFontFamily
+    {
+        get => _favoriteIconFontFamily;
+        set { _favoriteIconFontFamily = value; OnPropertyChanged(); }
+    }
+    private bool _isFavorite;
 
+    public ICommand FavoriteCommand { get; private set; }
     public ICommand RefreshCommand { get; }
     public ICommand ShowNearestStopCommand { get; private set; }
     public ICommand ReverseRouteCommand { get; private set; }
@@ -170,6 +184,7 @@ public partial class RouteDetailsPage : ContentPage
             _logger?.LogInformation("ReverseRouteCommand executed");
             ReverseRouteDirection();
         });
+        FavoriteCommand = new Command(async () => await ToggleFavorite());
 
         // Set up WebView events
         StopsMapView.Navigated += OnMapNavigated;
@@ -838,6 +853,8 @@ public partial class RouteDetailsPage : ContentPage
             
             // Start ETA display update timer
             StartEtaDisplayUpdateTimer();
+            
+            _ = RefreshFavoriteStatus();
         }
         catch (Exception ex)
         {
@@ -2083,6 +2100,51 @@ public partial class RouteDetailsPage : ContentPage
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Error reversing route direction");
+        }
+    }
+
+    private async Task RefreshFavoriteStatus()
+    {
+        if (Route == null) return;
+        var favorites = _databaseService.GetAllRecords<FavoriteRoute>("FavoriteRoutes");
+        _isFavorite = favorites.Any(f => f.RouteId == Route.Id);
+        if (_isFavorite)
+        {
+            FavoriteIconGlyph = "\uf005"; // Star filled
+            FavoriteIconFontFamily = "FontAwesomeSolid";
+        }
+        else
+        {
+            FavoriteIconGlyph = "\uf006"; // Star outline
+            FavoriteIconFontFamily = "FontAwesomeRegular";
+        }
+    }
+
+    private async Task ToggleFavorite()
+    {
+        if (Route == null) return;
+        var favorites = _databaseService.GetAllRecords<FavoriteRoute>("FavoriteRoutes");
+        var fav = favorites.FirstOrDefault(f => f.RouteId == Route.Id);
+        if (fav != null)
+        {
+            _databaseService.DeleteRecord<FavoriteRoute>("FavoriteRoutes", fav.Id);
+            _isFavorite = false;
+        }
+        else
+        {
+            var newFav = new FavoriteRoute { RouteId = Route.Id };
+            _databaseService.InsertRecord("FavoriteRoutes", newFav);
+            _isFavorite = true;
+        }
+        if (_isFavorite)
+        {
+            FavoriteIconGlyph = "\uf005"; // Star filled
+            FavoriteIconFontFamily = "FontAwesomeSolid";
+        }
+        else
+        {
+            FavoriteIconGlyph = "\uf006"; // Star outline
+            FavoriteIconFontFamily = "FontAwesomeRegular";
         }
     }
 } 
