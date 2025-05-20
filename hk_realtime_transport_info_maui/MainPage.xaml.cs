@@ -918,14 +918,11 @@ public partial class MainPage : ContentPage
 	{
 		base.OnAppearing();
 		
-		_logger?.LogInformation("OnAppearing: _allRoutes is empty, calling LoadRoutesDirectly.");
-		
 		// Show UI immediately instead of waiting for data
 		if (_allRoutes.Count == 0)
 		{
 			_logger?.LogInformation("OnAppearing: _allRoutes is empty, calling LoadRoutesDirectly.");
 			await LoadRoutesDirectly(false); // Load data without showing refresh indicator
-			
 			// Another pause to let other database operations complete
 			await Task.Delay(50);
 		}
@@ -1600,7 +1597,6 @@ public partial class MainPage : ContentPage
 						await Task.Run(() => 
 						{
 							sortedRoutes = SortRoutesNumerically(allRoutesLocal);
-							Thread.Sleep(1);
 						});
 						
 						_allRoutes = sortedRoutes;
@@ -1640,7 +1636,6 @@ public partial class MainPage : ContentPage
 								{
 									_routeTrie.AddRoute(route);
 								}
-								Thread.Sleep(1);
 							}
 						});
 						
@@ -2314,122 +2309,56 @@ public partial class MainPage : ContentPage
 					// Get a list of stop IDs for batch processing
 					var stopIds = nearbyStops.Select(s => s.Id).ToList();
 					
-					// Create dictionary to avoid UI updates during processing
-					var routesByStopId = new Dictionary<string, List<TransportRoute>>();
-					
-					// Process all stops in a single batch first
-					foreach (var stop in nearbyStops)
-					{
-						// Get routes for this stop from database
-						var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
-						
-						// Apply text search filter if needed
-						if (!string.IsNullOrEmpty(_searchQuery))
-						{
-							routesForStop = routesForStop.Where(r => 
-								r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
-						}
-						
-						// If this stop has matching routes, process it
-						if (routesForStop.Any())
-						{
-							routesByStopId[stop.Id] = routesForStop.OrderBy(r => r.RouteNumber).ToList();
-							totalRoutes += routesForStop.Count;
-						}
-					}
+					// Use the new batch method to get all routes for all stops at once
+					var routesByStopId = await _databaseService.GetRoutesForStopsAsync(stopIds);
 					
 					// Now create the stop groups with distances - all calculated off the UI thread
 					foreach (var stop in nearbyStops)
 					{
 						if (!routesByStopId.ContainsKey(stop.Id)) continue;
-						
+
+						// Apply text search filter if needed
+						var sortedRoutes = routesByStopId[stop.Id];
+						if (!string.IsNullOrEmpty(_searchQuery))
+						{
+							sortedRoutes = sortedRoutes.Where(r =>
+								r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
+						}
+						if (!sortedRoutes.Any()) continue;
+						totalRoutes += sortedRoutes.Count;
+
 						// Calculate distance from user to this stop
 						var stopLocation = new Location(stop.Latitude, stop.Longitude);
 						double distanceInMeters = Location.CalculateDistance(_userLocation, stopLocation, DistanceUnits.Kilometers) * 1000;
-						
-						// Get the sorted routes
-						var sortedRoutes = routesByStopId[stop.Id];
-						
+
 						// Create and add a StopGroup object
 						var stopGroup = new StopGroup(
-							stop, 
-							sortedRoutes, 
+							stop,
+							sortedRoutes.OrderBy(r => r.RouteNumber).ToList(),
 							distanceInMeters);
-						
+
 						stopGroups.Add(stopGroup);
 					}
-					
+
 					// Sort all stop groups by distance
 					stopGroups = stopGroups.OrderBy(sg => sg.DistanceInMeters).ToList();
-					
-					// First batch: Fetch ETAs in parallel for the first batch of stop groups
-					var etaTasks = new List<Task>();
-					const int initialBatchSize = 5; // Process first 5 stop groups with ETAs
-					
-					for (int i = 0; i < Math.Min(initialBatchSize, stopGroups.Count); i++)
-					{
-						etaTasks.Add(FetchAndApplyEtasForStopGroup(stopGroups[i]));
-					}
-					
-					// Wait for all initial ETA fetches to complete
+
+					// Fetch ETAs in parallel for all stop groups (not just first batch)
+					var etaTasks = stopGroups.Select(sg => FetchAndApplyEtasForStopGroup(sg));
 					await Task.WhenAll(etaTasks);
-					
-					// Update UI with first batch
+
+					// Update UI with all stop groups
 					await MainThread.InvokeOnMainThreadAsync(() => {
 						filteredItems.BeginBatch();
-						for (int i = 0; i < Math.Min(initialBatchSize, stopGroups.Count); i++)
+						foreach (var sg in stopGroups)
 						{
-							// Only add stop groups that have at least one route with a valid ETA
-							// if (stopGroups[i].HasAnyVisibleRoutesWithEta)
-							// {
-							//	filteredItems.Add(stopGroups[i]);
-							// }
-                            // Always add the stop group if it exists; ETAs will populate it.
-                            if (stopGroups[i] != null && stopGroups[i].Routes.Any())
-                            {
-                                filteredItems.Add(stopGroups[i]);
-                            }
+							if (sg != null && sg.Routes.Any())
+							{
+								filteredItems.Add(sg);
+							}
 						}
 						filteredItems.EndBatch();
 					});
-					
-					// Process remaining items in background
-					if (stopGroups.Count > initialBatchSize)
-					{
-						// Create batches for remaining stop groups
-						var remainingGroups = stopGroups.Skip(initialBatchSize).ToList();
-						const int batchSize = 5;
-						
-						for (int i = 0; i < remainingGroups.Count; i += batchSize)
-						{
-							var batch = remainingGroups.Skip(i).Take(batchSize).ToList();
-							var batchTasks = batch.Select(sg => FetchAndApplyEtasForStopGroup(sg));
-							
-							// Process batch in parallel
-							await Task.WhenAll(batchTasks);
-							
-							// Update UI with this batch
-							// var validGroups = batch.Where(sg => sg.HasAnyVisibleRoutesWithEta).ToList();
-							// if (validGroups.Any())
-							// {
-                            // Always add groups that have routes.
-                            var groupsToAdd = batch.Where(sg => sg != null && sg.Routes.Any()).ToList();
-                            if (groupsToAdd.Any())
-                            {
-								await MainThread.InvokeOnMainThreadAsync(() => {
-									filteredItems.BeginBatch();
-									foreach (var group in groupsToAdd) // Changed from validGroups
-									{
-										filteredItems.Add(group);
-									}
-									filteredItems.EndBatch();
-								});
-							}
-							
-							// Small delay between batches for UI responsiveness
-							await Task.Delay(20);
-						}
-					}
 				});
 				
 				if (filteredItems.Count == 0) // Check filteredItems (StopGroups) count
@@ -4609,124 +4538,66 @@ public partial class MainPage : ContentPage
 			if (_userLocation == null || filter == DistanceFilter.All)
 			{
 				var resultsList = FilterRoutesInternal();
-				// Removed KeyboardManager update here, should be handled by caller if needed after final list is ready
-				
 				var result = new ObservableRangeCollection<object>();
 				result.BeginBatch();
 				result.AddRange(resultsList);
 				result.EndBatch();
-				// Removed: Routes = result;
 				return result;
 			}
-			
+
 			// Get the list of nearby stops for the selected distance
 			List<TransportStop> nearbyStops = new List<TransportStop>();
-			
 			string distanceKey = "";
 			switch (filter)
 			{
-				case DistanceFilter.Meters100:
-					distanceKey = "100m";
-					break;
-				case DistanceFilter.Meters200:
-					distanceKey = "200m";
-					break;
-				case DistanceFilter.Meters400:
-					distanceKey = "400m";
-					break;
-				case DistanceFilter.Meters600:
-					distanceKey = "600m";
-					break;
+				case DistanceFilter.Meters100: distanceKey = "100m"; break;
+				case DistanceFilter.Meters200: distanceKey = "200m"; break;
+				case DistanceFilter.Meters400: distanceKey = "400m"; break;
+				case DistanceFilter.Meters600: distanceKey = "600m"; break;
 			}
-			
-			// Safely get stops for the selected distance
 			if (!string.IsNullOrEmpty(distanceKey) && _stopsNearby.ContainsKey(distanceKey))
 			{
 				nearbyStops = _stopsNearby[distanceKey];
 			}
-			
-			// Prepare initial UI update without ETAs
 			ObservableRangeCollection<object> filteredItems = new ObservableRangeCollection<object>();
-			
-			// If no nearby stops found, show empty list
 			if (nearbyStops.Count == 0)
 			{
-				// string noRoutesText = $"No stops found within {filter.ToString().Replace("Meters", "")} of your location.";
-				// var noRoutesLabel = this.FindByName<Microsoft.Maui.Controls.Label>("NoRoutesLabel");
-				// if (noRoutesLabel != null)
-				// {
-				// noRoutesLabel.Text = noRoutesText;
-				// }
-    
-				// Removed: Routes = filteredItems;
-				return filteredItems; // Return empty collection
+				return filteredItems;
 			}
-			
-			// Sort stops by distance for better UX
 			nearbyStops = nearbyStops.OrderBy(s => s.DistanceFromUser).ToList();
-			
-			// Process the stop groups without waiting for ETAs
 			var stopGroups = new List<StopGroup>();
-			
-			// Create dictionary to avoid UI updates during processing
-			var routesByStopId = new Dictionary<string, List<TransportRoute>>();
-			
-			// For each stop, get routes but don't fetch ETAs yet
+			// --- BATCH ROUTE QUERY ---
+			var stopIds = nearbyStops.Select(stop => stop.Id).ToList();
+			var routesByStopId = await _databaseService.GetRoutesForStopsAsync(stopIds);
 			foreach (var stop in nearbyStops)
 			{
-				var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
-				
-				// Apply text search filter if needed
+				var routesForStop = routesByStopId.ContainsKey(stop.Id) ? routesByStopId[stop.Id] : new List<TransportRoute>();
 				if (!string.IsNullOrEmpty(_searchQuery))
 				{
-					routesForStop = routesForStop.Where(r => 
-						r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
+					routesForStop = routesForStop.Where(r => r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
 				}
-				
-				// If this stop has matching routes, process it
 				if (routesForStop.Any())
 				{
-					// Create a StopGroup without ETAs initially
 					var stopGroup = new StopGroup(
-						stop, 
-						routesForStop.OrderBy(r => r.RouteNumber).ToList(), 
+						stop,
+						routesForStop.OrderBy(r => r.RouteNumber).ToList(),
 						stop.DistanceFromUser);
-					
 					stopGroups.Add(stopGroup);
 				}
 			}
-			
-			// Sort all stop groups by distance
 			stopGroups = stopGroups.OrderBy(sg => sg.DistanceInMeters).ToList();
-			
-			// Update UI immediately with stop groups (no ETAs yet)
 			filteredItems.BeginBatch();
 			foreach (var group in stopGroups)
 			{
 				filteredItems.Add(group);
 			}
 			filteredItems.EndBatch();
-			
-			// Log how many stop groups we're displaying
 			_logger?.LogInformation("Displaying {count} stop groups without ETAs", stopGroups.Count);
-			
-			// Update UI with these stop groups immediately
-			// Removed: Routes = filteredItems;
-			
-			// Force the collection view to update
-			// var collectionView = this.FindByName<CollectionView>("RoutesCollection");
-			// if (collectionView != null)
-			// {
-			// collectionView.ItemsSource = null;
-			// collectionView.ItemsSource = filteredItems;
-			// }
 			return filteredItems;
 		}
 		catch (Exception ex)
 		{
 			_logger?.LogError(ex, "Error in ApplyDistanceFilterWithoutEtasAsync: {message}", ex.Message);
-			
-			// Return empty collection on error
 			return new ObservableRangeCollection<object>();
 		}
 	}
@@ -4825,9 +4696,13 @@ public partial class MainPage : ContentPage
 						return;
 					}
 
-					var stopProcessingTasks = transportStopsToAddCandidates.Select(async stop =>
+					// Batch fetch all routes for all stops to add
+					var stopIds = transportStopsToAddCandidates.Select(stop => stop.Id).ToList();
+					var routesByStopId = await _databaseService.GetRoutesForStopsAsync(stopIds);
+
+					foreach (var stop in transportStopsToAddCandidates)
 					{
-						var routesForStop = await _databaseService.GetRoutesForStopAsync(stop.Id);
+						var routesForStop = routesByStopId.ContainsKey(stop.Id) ? routesByStopId[stop.Id] : new List<TransportRoute>();
 						if (!string.IsNullOrEmpty(_searchQuery))
 						{
 							routesForStop = routesForStop.Where(r => r.RouteNumber.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -4845,17 +4720,10 @@ public partial class MainPage : ContentPage
 							.ToList();
 						if (routesForStop.Any())
 						{
-							// Calculate distance in Kilometers then convert to meters for the StopGroup constructor
-							// Calculate distance for the StopGroup constructor that expects distanceInMeters
 							double distance = Location.CalculateDistance(locationSnapshot, new Location(stop.Latitude, stop.Longitude), DistanceUnits.Kilometers) * 1000;
-							return new StopGroup(stop, routesForStop, distance);
+							tempInitialGroupsForNewStops.Add(new StopGroup(stop, routesForStop, distance));
 						}
-						return null;
-					}).ToList();
-
-					var results = await Task.WhenAll(stopProcessingTasks);
-					
-					tempInitialGroupsForNewStops.AddRange(results.Where(sg => sg != null)!);
+					}
 				});
 				stopwatch.Stop();
 				_logger?.LogInformation("Adapt: DB processing for {count} new stops took {ms}ms.", transportStopsToAddCandidates.Count, stopwatch.ElapsedMilliseconds);

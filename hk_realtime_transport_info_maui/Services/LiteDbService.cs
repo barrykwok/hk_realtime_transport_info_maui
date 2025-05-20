@@ -1450,5 +1450,49 @@ namespace hk_realtime_transport_info_maui.Services
         {
             return await Task.Run(() => DeleteRecord<T>(collectionName, id));
         }
+        
+        /// <summary>
+        /// Gets routes for multiple stops in a single batch query for performance.
+        /// </summary>
+        /// <param name="stopIds">The stop IDs to fetch routes for.</param>
+        /// <returns>Dictionary of stopId to list of TransportRoute.</returns>
+        public async Task<Dictionary<string, List<TransportRoute>>> GetRoutesForStopsAsync(IEnumerable<string> stopIds)
+        {
+            var result = new Dictionary<string, List<TransportRoute>>();
+            if (stopIds == null) return result;
+            var stopIdList = stopIds.Where(id => !string.IsNullOrEmpty(id)).Distinct().ToList();
+            if (stopIdList.Count == 0) return result;
+
+            try
+            {
+                var db = GetDatabase();
+                var relationCollection = db.GetCollection<RouteStopRelation>("RouteStopRelations");
+                var routeCollection = db.GetCollection<TransportRoute>("TransportRoutes");
+
+                // Query all relations for these stopIds in one go
+                var allRelations = relationCollection.Find(r => stopIdList.Contains(r.StopId)).ToList();
+                var stopIdToRouteIds = allRelations
+                    .GroupBy(r => r.StopId)
+                    .ToDictionary(g => g.Key, g => g.Select(r => r.RouteId).Where(rid => !string.IsNullOrEmpty(rid)).Distinct().ToList());
+
+                // Fetch all unique routeIds in one go
+                var allRouteIds = stopIdToRouteIds.Values.SelectMany(x => x).Distinct().ToList();
+                var allRoutes = routeCollection.Find(r => allRouteIds.Contains(r.Id)).ToList();
+                var routeDict = allRoutes.ToDictionary(r => r.Id, r => r);
+
+                // Map back to stopId -> List<TransportRoute>
+                foreach (var kvp in stopIdToRouteIds)
+                {
+                    var routes = kvp.Value.Select(rid => routeDict.TryGetValue(rid, out var route) ? route : null)
+                        .Where(r => r != null).ToList();
+                    result[kvp.Key] = routes!;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error in GetRoutesForStopsAsync batch query");
+            }
+            return result;
+        }
     }
 } 
